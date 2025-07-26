@@ -6,6 +6,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 from torchdyn.models import CNF
 from torchdiffeq import odeint
+import os
 
 # ---- 1. Load and parse data ----
 FILENAME = "opticks_hits_output.txt"
@@ -139,6 +140,38 @@ for epoch in range(num_epochs):
             val_nll = -val_ll.mean().item()
             print(f"Epoch {epoch:03d} | Train NLL: {loss.item():.3f} | Val NLL: {val_nll:.3f}")
             scheduler.step(val_nll)
+
+
+# Create output directory for quiver frames
+output_dir = "quiver_frames"
+os.makedirs(output_dir, exist_ok=True)
+# Parameters for quiver grid
+grid_size = 20
+xv, yv = np.meshgrid(np.linspace(-2, 2, grid_size), np.linspace(-2, 2, grid_size))
+points = np.stack([xv.ravel(), yv.ravel()], axis=1).astype(np.float32)   # <-- fixed
+
+# Pick a representative event (first from validation set)
+event_idx = list(val_events)[0]
+event_id_tensor = torch.full((points.shape[0],), event_to_idx[event_idx], dtype=torch.long, device=device)
+
+# Quiver plots at multiple time slices
+timesteps = np.linspace(0, 1, 20, dtype=np.float32)  # Now float32
+for i, t in enumerate(timesteps):
+    t_tensor = torch.tensor(t, dtype=torch.float32, device=device)
+    with torch.no_grad():
+        vf = vector_field(t_tensor, (torch.tensor(points, dtype=torch.float32, device=device), event_id_tensor))
+    u, v = vf[:, 0].cpu().numpy(), vf[:, 1].cpu().numpy()
+
+    plt.figure(figsize=(6,6))
+    plt.quiver(points[:, 0], points[:, 1], u, v, angles='xy')
+    plt.xlim(-2, 2); plt.ylim(-2, 2)
+    plt.xlabel("x"); plt.ylabel("y")
+    plt.title(f"Vector Field, t={t:.2f}")
+    plt.tight_layout()
+    fname = os.path.join(output_dir, f"quiver_{i:03d}.png")
+    plt.savefig(fname)
+    plt.close()
+print(f"Saved {len(timesteps)} quiver frames in {output_dir}")
 
 # ---- 6. Plot 10 random real and generated events ----
 import random
