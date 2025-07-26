@@ -12,8 +12,8 @@
 ## Quick Start
 ~~~bash
 # clone
-git clone https://github.com/<your‑org>/pfRICH‑Gen.git
-cd pfRICH‑Gen
+git clone https://github.com/BNLNPPS/esi-fastlight
+cd esi-fastlight/
 
 #  dependencies
 torch>=2.2
