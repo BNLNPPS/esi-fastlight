@@ -1,0 +1,1 @@
+This project is aimed to develop an ML model to produce pfRICH hitmaps that can be used to test tracking algorithms or to teach ML models. Since the ML model can create hitmaps, one does not have to install and run Geant4 to be able to produce data. 
