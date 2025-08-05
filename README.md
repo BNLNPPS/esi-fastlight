@@ -35,7 +35,7 @@ During training, PNGs in **./progress/** compare **real** (Geant4 / Opticks) vs 
 | **Prior**              | Mixture of thin ring (Cherenkov rim) + tight Gaussian centre + wide Gaussian noise                                                                                |
 | **Training objective** | Maximum log-likelihood (negative log-probability of mapped samples)                                                                                               |
 | **Optimisation**       | AdamW (lr 3 × 10⁻⁴), gradient clipping 0.5, AMP mixed precision (`torch.cuda.amp`)                                                                                 |
-| **Data**               | Parsed `(x, y)` hit positions from **opticks_hits_output.txt**; split **70 / 15 / 15 %** into train / val / test on *event* granularity                            |
+| **Data**               | Parsed `(x, y)` hit positions from **opticks_hits_output.txt**; split **70 / 15 / 15 %** into train / val / test on *event* granularity  (reach out to author for data)                          |
 | **Speed-ups**          | Fixed-step RK4 (≈ 20 NFEs) instead of adjoint Dopri5; smaller network; AMP; optional GPU                                                                           |
 
 ---
