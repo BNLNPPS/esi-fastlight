@@ -1,205 +1,180 @@
-import re
-import numpy as np
-import torch
-import torch.nn as nn
-from collections import defaultdict
+#!/usr/bin/env python3
+# train_cnf_amp_fast_compat.py
+# Compact CNF + AMP + Hutchinson  (ring + center + noise prior)
+
+# ────────────────────────────── Imports ──────────────────────────────
+import math, random, re, numpy as np, torch, torch.nn as nn
+import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from torchdyn.models import CNF
-from torchdiffeq import odeint
-import os
+from collections import defaultdict
+from pathlib import Path
+from contextlib import nullcontext
+from torchdiffeq import odeint                       # pip install torchdiffeq
 
-# ---- 1. Load and parse data ----
-FILENAME = "opticks_hits_output.txt"
-event_positions = defaultdict(list)
-with open(FILENAME) as f:
-    for line in f:
-        match = re.match(
-            r"([\deE\+\.\-]+) ([\deE\+\.\-]+)\s+\(([\deE\+\.\-,\s]+)\)\s+\(([\deE\+\.\-,\s]+)\)\s+\(([\deE\+\.\-,\s]+)\)\s+CreationProcessID=(\d+)",
-            line.strip()
-        )
-        if match:
-            time = float(match.group(1))
-            event_number = int(time // 1000)
-            pos_str = match.group(3)
-            pos = np.array([float(x) for x in pos_str.split(',')])
-            event_positions[event_number].append(pos)
+from torch.cuda.amp import GradScaler, autocast      # works on all torch versions
 
-# ---- 2. Event indexing and splits ----
-all_event_numbers = sorted(list(event_positions.keys()))
-event_to_idx = {ev: i for i, ev in enumerate(all_event_numbers)}
-num_events = len(all_event_numbers)
+# ───────────────────────── 1. LOAD & SPLIT ──────────────────────────
+FNAME = "opticks_hits_output.txt"
+hits, pat = defaultdict(list), re.compile(r"([\deE.+-]+)\s+[\deE.+-]+\s+\(([^)]+)\).*")
 
-event_numbers = np.array(all_event_numbers)
-np.random.seed(42)
-np.random.shuffle(event_numbers)
+for ln in open(FNAME):
+    if (m := pat.match(ln)):
+        ev  = int(float(m.group(1)) // 1000)
+        xy  = np.fromstring(m.group(2), sep=',', dtype=np.float32)[:2]
+        if xy.size == 2: hits[ev].append(xy)
 
-n_total = len(event_numbers)
-n_train = int(0.7 * n_total)
-n_val = int(0.15 * n_total)
-n_test = n_total - n_train - n_val
+all_ev = np.array(sorted(hits))
+np.random.default_rng(42).shuffle(all_ev)
+cut1, cut2 = int(.7*len(all_ev)), int(.85*len(all_ev))
+ev_train, ev_val = all_ev[:cut1], all_ev[cut1:cut2]
 
-train_events = set(event_numbers[:n_train])
-val_events = set(event_numbers[n_train:n_train + n_val])
-test_events = set(event_numbers[n_train + n_val:])
+stack = lambda evs: torch.from_numpy(np.vstack([hits[e] for e in evs]))
+train, val = map(stack, (ev_train, ev_val))
 
-def events_to_tensor_with_eventid(event_subset):
-    data, event_ids = [], []
-    for ev in event_subset:
-        for pos in event_positions[ev]:
-            data.append(pos[:2])  # ONLY X, Y coordinates
-            event_ids.append(event_to_idx[ev])
-    return torch.tensor(np.array(data), dtype=torch.float32), torch.tensor(event_ids, dtype=torch.long)
+# ───────────────────────── 2. NORMALISE ─────────────────────────────
+mean, std  = train.mean(0), train.std(0)
+train, val = (train-mean)/std, (val-mean)/std
 
-train_data, train_ev_ids = events_to_tensor_with_eventid(train_events)
-val_data, val_ev_ids = events_to_tensor_with_eventid(val_events)
-test_data, test_ev_ids = events_to_tensor_with_eventid(test_events)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+train, val = train.to(device), val.to(device)
+torch.manual_seed(0)
 
-# ---- 3. Normalization ----
-mean, std = train_data.mean(0), train_data.std(0)
-train_data = (train_data - mean) / std
-val_data = (val_data - mean) / std
-test_data = (test_data - mean) / std
+# ───────────────────────── 3. CNF MODEL ────────────────────────────
+HIDDEN = 128
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-data_dim = 2
-embed_dim = 12
-
-# ---- Updated Improved Model ----
-class VectorField(nn.Module):
-    def __init__(self, num_events, embed_dim, data_dim):
+class VF(nn.Module):
+    def __init__(self, d=2, h=HIDDEN):
         super().__init__()
-        self.event_emb = nn.Embedding(num_events, embed_dim)
         self.net = nn.Sequential(
-            nn.Linear(data_dim + embed_dim + 1, 512),
-            nn.LayerNorm(512),
-            nn.SiLU(),
-            nn.Linear(512, 512),
-            nn.LayerNorm(512),
-            nn.SiLU(),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.SiLU(),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
-            nn.SiLU(),
-            nn.Linear(256, data_dim)
+            nn.Linear(d+1, h), nn.SiLU(),
+            nn.Linear(h, h),   nn.SiLU(),
+            nn.Linear(h, h//2), nn.SiLU(),
+            nn.Linear(h//2, d)
         )
+    def forward(self, t, y):
+        return self.net(torch.cat([y, t.expand(len(y),1)], 1))
 
-    def forward(self, t, y_event):
-        y, event_id = y_event
-        emb = self.event_emb(event_id)
-        t_exp = t.expand(y.shape[0], 1)
-        inp = torch.cat([y, emb, t_exp], dim=1)
-        return self.net(inp)
+vf = VF().to(device)
 
-vector_field = VectorField(num_events, embed_dim, data_dim).to(device)
-optimizer = torch.optim.AdamW(vector_field.parameters(), lr=5e-4, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=15, factor=0.3)
+class CNF_ODE(nn.Module):
+    def __init__(self, vf): super().__init__(); self.vf = vf
+    def forward(self, t, states):
+        y, logp = states
+        y = y.detach().requires_grad_(True)
+        with torch.enable_grad():
+            dy  = self.vf(t, y)
+            v   = torch.empty_like(dy).bernoulli_().mul_(2).sub_(1)
+            vdy = (dy*v).sum()
+            div = (torch.autograd.grad(vdy, y, create_graph=True)[0]*v).sum(-1, keepdim=True)
+        return dy, -div
 
-# Gradient clipping to stabilize training
-clip_value = 1.0
+odefunc = CNF_ODE(vf)
+scaler  = GradScaler(enabled=(device.type == "cuda"))
 
-# Prior
-torch.manual_seed(42) # ;)
-prior = torch.distributions.MultivariateNormal(torch.zeros(data_dim, device=device), torch.eye(data_dim, device=device))
+# ───────────── 4. PRIOR = ring + center + wide noise ───────────────
+class RingPrior(torch.distributions.Distribution):
+    arg_constraints, has_rsample, EPS = {}, False, 1e-6
+    def __init__(self, radius=1.0, std=0.05, device="cpu"):
+        super().__init__();  self.R, self.s, self.dev = radius, std, device
+    def sample(self, shape=torch.Size()):
+        theta = torch.rand(shape, device=self.dev) * 2 * math.pi
+        r     = self.R + self.s*torch.randn(shape, device=self.dev)
+        return torch.stack([r*torch.cos(theta), r*torch.sin(theta)], -1)
+    def log_prob(self, x):
+        r = torch.sqrt((x**2).sum(-1)+self.EPS)
+        return -((r-self.R)**2)/(2*self.s**2) - torch.log(r+self.EPS) \
+               - math.log(self.s*math.sqrt(2*math.pi))
 
-train_data, train_ev_ids = train_data.to(device), train_ev_ids.to(device)
-val_data, val_ev_ids = val_data.to(device), val_ev_ids.to(device)
-test_data, test_ev_ids = test_data.to(device), test_ev_ids.to(device)
+with torch.no_grad():
+    ring_R = torch.median(torch.sqrt((train**2).sum(-1))).item()
 
-# Training Loop
-num_epochs = 50
-batch_size = 1024
+ring      = RingPrior(ring_R, 0.05, device)
+center    = torch.distributions.MultivariateNormal(torch.zeros(2,device=device),
+                                                   torch.eye(2,device=device)*0.05**2)
+noise_big = torch.distributions.MultivariateNormal(torch.zeros(2,device=device),
+                                                   torch.eye(2,device=device)*3.0**2)
 
-def get_log_likelihood(x, event_ids):
-    t_span = torch.tensor([0., 1.], device=device)
-    y = x.to(device)
-    e = event_ids.to(device)
-    z_t = odeint(lambda t, y: vector_field(t, (y, e)), y, t_span, atol=1e-5, rtol=1e-5, method='dopri5')
-    z = z_t[-1]
-    log_pz = prior.log_prob(z)
-    return log_pz
+mix_w = torch.tensor([0.60, 0.25, 0.15], device=device)
+cat   = torch.distributions.Categorical(mix_w)
 
-for epoch in range(num_epochs):
-    vector_field.train()
-    idx = torch.randperm(len(train_data))[:batch_size]
-    batch_x, batch_event = train_data[idx], train_ev_ids[idx]
-    ll = get_log_likelihood(batch_x, batch_event)
-    loss = -ll.mean()
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(vector_field.parameters(), clip_value)
-    optimizer.step()
+class MixturePrior(torch.distributions.Distribution):
+    arg_constraints, has_rsample = {}, False
+    def __init__(self, comps, cat):
+        super().__init__(); self.comps, self.cat = comps, cat
+    def sample(self, shape=torch.Size()):
+        N   = int(torch.tensor(shape).prod()) or 1
+        idx = self.cat.sample((N,))
+        out = torch.empty(N,2,device=idx.device)
+        for i,c in enumerate(self.comps):
+            m = idx==i
+            if m.any(): out[m] = c.sample((m.sum(),))
+        return out.reshape(*shape,2)
+    def log_prob(self, x):
+        log_w = torch.log(mix_w)
+        lp = torch.stack([c.log_prob(x)+lw for c,lw in zip(self.comps,log_w)], 0)
+        return torch.logsumexp(lp, 0)
 
-    if epoch % 10 == 0 or epoch == num_epochs - 1:
-        vector_field.eval()
-        with torch.no_grad():
-            idx = torch.randperm(len(val_data))[:4096]
-            val_x, val_event = val_data[idx], val_ev_ids[idx]
-            val_ll = get_log_likelihood(val_x, val_event)
-            val_nll = -val_ll.mean().item()
-            print(f"Epoch {epoch:03d} | Train NLL: {loss.item():.3f} | Val NLL: {val_nll:.3f}")
-            scheduler.step(val_nll)
+prior = MixturePrior([ring, center, noise_big], cat)
 
+# ───────────────── 5. LOG-PROB VIA ODE (FAST) ──────────────────────
+def forward_logp(x):
+    logp0 = torch.zeros(x.size(0),1,device=x.device,dtype=x.dtype)
+    z, logp = odeint(
+        odefunc, (x,logp0),
+        torch.tensor([0.,1.],device=x.device),
+        method="rk4",
+        options=dict(step_size=0.05),
+        atol=3e-4, rtol=3e-4
+    )
+    return prior.log_prob(z) + logp.squeeze(-1)
 
-# Create output directory for quiver frames
-output_dir = "quiver_frames"
-os.makedirs(output_dir, exist_ok=True)
-# Parameters for quiver grid
-grid_size = 20
-xv, yv = np.meshgrid(np.linspace(-2, 2, grid_size), np.linspace(-2, 2, grid_size))
-points = np.stack([xv.ravel(), yv.ravel()], axis=1).astype(np.float32)   # <-- fixed
+# ───────────────────────── 6. VISUALISATION ────────────────────────
+Path("progress").mkdir(exist_ok=True)
+sample_evs = random.sample(list(ev_val), 2)
 
-# Pick a representative event (first from validation set)
-event_idx = list(val_events)[0]
-event_id_tensor = torch.full((points.shape[0],), event_to_idx[event_idx], dtype=torch.long, device=device)
+def plot_epoch(ep):
+    fig = plt.figure(figsize=(12,5))
+    for k,ev in enumerate(sample_evs):
+        real = (np.vstack(hits[ev])-mean.cpu().numpy())/std.cpu().numpy()
+        z    = prior.sample((real.shape[0],))
+        with torch.no_grad(), \
+             (autocast() if device.type=='cuda' else nullcontext()):
+            x_inv,_ = odeint(odefunc, (z, torch.zeros_like(z[:, :1])),
+                             torch.tensor([1.,0.],device=device),
+                             method="rk4", options=dict(step_size=0.05))
+        gen  = (x_inv[-1].cpu()*std + mean).numpy()
+        real_den = real*std.cpu().numpy()+mean.cpu().numpy()
+        ax = fig.add_subplot(1,2,k+1)
+        ax.scatter(*real_den.T, s=5, c='steelblue', lw=0, label='Real')
+        ax.scatter(*gen.T,     s=5, c='orange',    lw=0, label='Gen')
+        ax.set_title(f"Event {ev}"); ax.set_xticks([]); ax.set_yticks([])
+        if k==0: ax.legend()
+    fig.tight_layout()
+    fig.savefig(Path("progress")/f"ep{ep:03d}.png", dpi=150); plt.close(fig)
 
-# Quiver plots at multiple time slices
-timesteps = np.linspace(0, 1, 20, dtype=np.float32)  # Now float32
-for i, t in enumerate(timesteps):
-    t_tensor = torch.tensor(t, dtype=torch.float32, device=device)
-    with torch.no_grad():
-        vf = vector_field(t_tensor, (torch.tensor(points, dtype=torch.float32, device=device), event_id_tensor))
-    u, v = vf[:, 0].cpu().numpy(), vf[:, 1].cpu().numpy()
+# ───────────────────────── 7. TRAIN ────────────────────────────────
+BATCH, EPOCHS, PLOT_EVERY = 512, 200, 20
+opt     = torch.optim.AdamW(vf.parameters(), lr=3e-4)
+rand_id = lambda d: torch.randint(0, d.size(0), (BATCH,), device=device)
+amp_ctx = autocast if device.type=='cuda' else nullcontext
 
-    plt.figure(figsize=(6,6))
-    plt.quiver(points[:, 0], points[:, 1], u, v, angles='xy')
-    plt.xlim(-2, 2); plt.ylim(-2, 2)
-    plt.xlabel("x"); plt.ylabel("y")
-    plt.title(f"Vector Field, t={t:.2f}")
-    plt.tight_layout()
-    fname = os.path.join(output_dir, f"quiver_{i:03d}.png")
-    plt.savefig(fname)
-    plt.close()
-print(f"Saved {len(timesteps)} quiver frames in {output_dir}")
+for ep in range(EPOCHS):
+    vf.train(); opt.zero_grad(set_to_none=True)
+    x = train[rand_id(train)]
+    with amp_ctx():
+        loss = -forward_logp(x).mean()
+    scaler.scale(loss).backward()
+    scaler.unscale_(opt)
+    torch.nn.utils.clip_grad_norm_(vf.parameters(), 0.5)
+    scaler.step(opt); scaler.update()
 
-# ---- 6. Plot 10 random real and generated events ----
-import random
-fig = plt.figure(figsize=(22, 9))
-chosen_events = np.random.choice(list(val_events), size=10, replace=False)
+    if ep % PLOT_EVERY == 0:
+        plot_epoch(ep)
+        print(f"Epoch {ep:03d} | loss {loss.item():.4f}")
 
-for i, event_number in enumerate(chosen_events):
-    event_idx = event_to_idx[event_number]
-    # Extract real hits for this event (denormalized)
-    real_hits = np.array([pos for ev, pos in zip(val_ev_ids.cpu().numpy(), val_data.cpu().numpy()) if ev == event_idx])
-    real_hits = real_hits * std.cpu().numpy() + mean.cpu().numpy()
-    num_points = len(real_hits)
-    z_samples = torch.randn(num_points, data_dim, device=device)
-    event_id_tensor = torch.full((num_points,), event_idx, dtype=torch.long, device=device)
-    t_span = torch.tensor([1., 0.], device=device)
-    with torch.no_grad():
-        x_t = odeint(lambda t, y: vector_field(t, (y, event_id_tensor)), z_samples, t_span, atol=1e-5, rtol=1e-5, method='dopri5')
-        x_generated = x_t[-1].cpu().numpy()
-        x_generated = x_generated * std.cpu().numpy() + mean.cpu().numpy()
-
-    ax = fig.add_subplot(2, 5, i+1)
-    ax.scatter(real_hits[:, 0], real_hits[:, 1], label='Real', alpha=0.6)
-    ax.scatter(x_generated[:, 0], x_generated[:, 1], label='CNF Gen', alpha=0.6)
-    ax.set_title(f"Event {event_number}")
-    ax.set_xticks([]); ax.set_yticks([])
-    if i == 0:
-        ax.legend()
-
-plt.suptitle("10 Random Validation Events: Real (blue) vs CNF Generated (orange)")
-plt.tight_layout()
-plt.show()
+# ───────────────────────── 8. SAVE ────────────────────────────────
+torch.save({"vf_state_dict": vf.state_dict(),
+            "mean": mean.cpu(),
+            "std":  std.cpu()},
+           "cnf_ring_central_noise.pt")
+print("✓ Saved model to cnf_ring_central_noise.pt")
