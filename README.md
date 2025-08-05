@@ -40,16 +40,6 @@ During training, PNGs in **./progress/** compare **real** (Geant4 / Opticks) vs 
 
 ---
 
-## Results (snapshot)
-
-| Metric | Validation (↓) |
-| ------ | -------------- |
-| **NLL** | ~**x.xx** after 200 epochs (batch 512)\* |
-
-\* Exact value depends on dataset size and RNG seed.
-
----
-
 ## Usage
 
 ### 1 · Train the CNF from Scratch
