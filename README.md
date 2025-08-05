@@ -23,7 +23,7 @@ numpy
 matplotlib
 
 # train the CNF 
-python3.9 TeachCNF.py
+python3.9 TrainingCNF.py
 ~~~
 After training, a figure pops up comparing **real** (Geant4/GPU MC simulation) vs **generated** hitmaps for ten random validation events.
 
@@ -55,7 +55,7 @@ After training, a figure pops up comparing **real** (Geant4/GPU MC simulation) v
 
 ### 1. Training from Scratch
 ~~~bash
-python3.9 TeachCNF.py
+python3.9 TrainingCNF.py
 ~~~
 
 ## Validation vs Real Plot
