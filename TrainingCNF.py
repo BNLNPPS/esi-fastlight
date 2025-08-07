@@ -3,7 +3,7 @@
 # Conditional CNF that learns p(x, y | N) with *isotropic*
 # normalisation (one shared σ) so generated rings stay circular.
 # Saves:
-#   • cnf_condN_iso.pt   (weights + xy_mean + iso_std + logN stats)
+#   • cnf_condN_iso.pt   (weights + xy_mean + iso_std + logN stats + mix_logits)
 #   • counts.npy         (empirical multiplicity PMF)
 #   • progress/epXXX.png (training snapshots, equal aspect)
 # ---------------------------------------------------------------
@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from torchdiffeq import odeint
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
+from contextlib import nullcontext  # NEW
 
 # ───────────────────── 1. LOAD & ORGANISE EVENTS ──────────────────
 FNAME = "opticks_hits_output.txt"
@@ -51,10 +52,8 @@ def to_tensor(ev_subset):
         rows.append(np.hstack([pts, n_col]))                          # (N,3)
     return torch.from_numpy(np.vstack(rows))
 
-train, val = map(to_tensor, (ev_train, ev_val))
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-train, val = train.to(device), val.to(device)
+train, val = map(lambda x: to_tensor(x).to(device), (ev_train, ev_val))
 torch.manual_seed(0)
 
 # ───────────────────── 2. MODEL DEFINITIONS ───────────────────────
@@ -89,7 +88,7 @@ vf      = VF().to(device)
 odefunc = CNF_ODE(vf)
 scaler  = GradScaler(enabled=(device.type=="cuda"))
 
-# prior over (x',y')
+# ── Prior over (x',y') with LEARNABLE MIXTURE WEIGHTS ─────────────
 class RingPrior(torch.distributions.Distribution):
     arg_constraints, has_rsample, EPS = {}, False, 1e-6
     def __init__(self, R=1.0, s=0.05, dev="cpu"):
@@ -109,25 +108,37 @@ center = torch.distributions.MultivariateNormal(torch.zeros(2,device=device),
                                                 torch.eye(2,device=device)*0.05**2)
 noise  = torch.distributions.MultivariateNormal(torch.zeros(2,device=device),
                                                 torch.eye(2,device=device)*3.0**2)
-mix_w  = torch.tensor([.60,.25,.15], device=device)
-cat    = torch.distributions.Categorical(mix_w)
-class MixXY(torch.distributions.Distribution):
-    arg_constraints, has_rsample = {}, False
-    def __init__(self, comps, cat): super().__init__(); self.c,self.cat=comps,cat
+
+# NEW: learnable logits (initialised from your old weights 0.60/0.25/0.15)
+mix_logits = nn.Parameter(torch.log(torch.tensor([.60, .25, .15], device=device)))
+
+class MixXY(nn.Module):  # NEW: mixture wrapper that uses learnable logits
+    def __init__(self, comps, logits_param):
+        super().__init__()
+        self.c = comps
+        self.logits = logits_param  # nn.Parameter shared with optimiser
+    def weights(self):
+        return torch.softmax(self.logits, 0)
     def sample(self, shape=torch.Size()):
-        N=int(torch.tensor(shape).prod()) or 1
-        idx=self.cat.sample((N,))
-        out=torch.empty(N,2,device=idx.device)
-        for i,comp in enumerate(self.c):
-            m=idx==i
-            if m.any(): out[m]=comp.sample((m.sum(),))
-        return out.reshape(*shape,2)
+        N = int(torch.tensor(shape).prod()) or 1
+        w = self.weights()
+        cat = torch.distributions.Categorical(w)
+        idx = cat.sample((N,))
+        out = torch.empty(N,2, device=w.device)
+        for i, comp in enumerate(self.c):
+            m = (idx == i)
+            if m.any():
+                out[m] = comp.sample((m.sum(),))
+        return out.reshape(*shape, 2)
     def log_prob(self, x):
-        logw=torch.log(mix_w)
-        lp=torch.stack([c.log_prob(x)+lw for c,lw in zip(self.c,logw)],0)
-        return torch.logsumexp(lp,0)
-xy_prior = MixXY([ring,center,noise],cat)
+        w = self.weights()
+        logw = torch.log(w + 1e-12)
+        lp = torch.stack([comp.log_prob(x) for comp in self.c], 0)  # (K,N)
+        return torch.logsumexp(logw.unsqueeze(1) + lp, dim=0)
+
+xy_prior = MixXY([ring, center, noise], mix_logits)
 n_prior  = torch.distributions.Normal(0.0,1.0)
+
 def prior_logp(z):
     xy, z_n = z[..., :2], z[..., 2]
     return xy_prior.log_prob(xy) + n_prior.log_prob(z_n)
@@ -150,10 +161,11 @@ def plot_epoch(ep):
         real_xy = (np.asarray(hits[ev],np.float32)-xy_mean)/iso_std
         N=len(real_xy)
         n_feat=((math.log(N)-logN_mu)/logN_std).astype(np.float32)
+        # NEW: sample using current learned weights
         z_xy=xy_prior.sample((N,)).to(device)
         z_n=torch.full((N,1), n_feat, device=device)
         z=torch.cat([z_xy,z_n],1)
-        with torch.no_grad(), autocast(device_type='cuda') if device.type=='cuda' else torch.device("cpu"):
+        with torch.no_grad(), (autocast(device_type='cuda') if device.type=='cuda' else nullcontext()):
             x_inv,_ = odeint(odefunc,(z,torch.zeros_like(z[:,:1])),
                              torch.tensor([1.,0.],device=device),
                              method="rk4",options={"step_size":0.05})
@@ -168,9 +180,18 @@ def plot_epoch(ep):
     fig.savefig(Path("progress")/f"ep{ep:03d}.png",dpi=150); plt.close(fig)
 
 BATCH,EPOCHS,PLOT_EVERY = 512, 200, 20
-opt = torch.optim.AdamW(vf.parameters(), lr=3e-4)
+
+# NEW: include mix_logits in the optimiser (no weight decay on logits)
+opt = torch.optim.AdamW(
+    [
+        {"params": vf.parameters()},
+        {"params": [mix_logits], "weight_decay": 0.0}
+    ],
+    lr=3e-4
+)
+
 rand_id=lambda d: torch.randint(0,d.size(0),(BATCH,),device=device)
-amp_ctx=autocast(device_type='cuda') if device.type=='cuda' else torch.device("cpu")
+amp_ctx=(autocast(device_type='cuda') if device.type=='cuda' else nullcontext())  # NEW
 
 for ep in range(EPOCHS):
     vf.train(); opt.zero_grad(set_to_none=True)
@@ -181,7 +202,10 @@ for ep in range(EPOCHS):
     scaler.step(opt); scaler.update()
     if ep%PLOT_EVERY==0:
         plot_epoch(ep)
-        print(f"Epoch {ep:03d} | loss {loss.item():.4f}")
+        # NEW: print the current learned weights for visibility
+        with torch.no_grad():
+            w = torch.softmax(mix_logits, 0).detach().cpu().numpy()
+        print(f"Epoch {ep:03d} | loss {loss.item():.4f} | weights ring/center/noise = {w}")
 
 # ───────────────────── 4. SAVE ────────────────────────────────────
 torch.save(dict(
@@ -189,6 +213,7 @@ torch.save(dict(
     xy_mean=xy_mean,
     iso_std=iso_std,
     logN_mu=logN_mu,
-    logN_std=logN_std
+    logN_std=logN_std,
+    mix_logits=mix_logits.detach().cpu().numpy()  # NEW
 ), "cnf_condN_iso.pt")
-print("✓ Saved cnf_condN_iso.pt and counts.npy")
+print("✓ Saved cnf_condN_iso.pt (incl. mix_logits) and counts.npy")
