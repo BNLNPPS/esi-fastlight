@@ -98,38 +98,42 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(SEED)
 train, val = map(lambda es: to_tensor(es).to(device), (ev_train, ev_val))
 
-# ───────────────────── 4. MODEL DEFINITIONS ───────────────────────
+# ── Model: ~4,903 trainable params (COND_DIM=7 → STATE_DIM=9; +t appended) ──
+HIDDEN   = 53
 COND_DIM = 7
-STATE_DIM = 2 + COND_DIM
+STATE_DIM = 2 + COND_DIM  # (x,y) + 7 conditioners
 
-class VF(nn.Module):
+class VF(torch.nn.Module):
     def __init__(self, d=STATE_DIM, h=HIDDEN):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d+1, h), nn.SiLU(),
-            nn.Linear(h,h),    nn.SiLU(),
-            nn.Linear(h,h//2), nn.SiLU(),
-            nn.Linear(h//2, 2)
+        # Input to the first layer is (d + 1) because we concat scalar time t
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(d + 1, h), torch.nn.SiLU(),   # 10 → 53
+            torch.nn.Linear(h, h),     torch.nn.SiLU(),   # 53 → 53
+            torch.nn.Linear(h, h//2),  torch.nn.SiLU(),   # 53 → 26
+            torch.nn.Linear(h//2, 2)                      # 26 → 2  (dx, dy)
         )
     def forward(self, t, y):
-        return self.net(torch.cat([y, t.expand(len(y),1)], 1))
+        return self.net(torch.cat([y, t.expand(len(y), 1)], 1))
 
-class CNF_ODE(nn.Module):
-    def __init__(self, vf):
-        super().__init__(); self.vf = vf
+class CNF_ODE(torch.nn.Module):
+    def __init__(self, vf): 
+        super().__init__(); 
+        self.vf = vf
     def forward(self, t, states):
-        y, logp = states
+        y, logp = states                  # y: (N, 2 + COND_DIM), logp: (N,1)
         y = y.detach().requires_grad_(True)
         with torch.enable_grad():
-            dy_xy = self.vf(t, y)
-            zeros = torch.zeros_like(y[:, 2:])
+            dy_xy = self.vf(t, y)         # (N,2)
+            zeros = torch.zeros_like(y[:, 2:])  # keep conditioners static
             dy    = torch.cat([dy_xy, zeros], -1)
+            # Hutchinson trace estimator
             v     = torch.empty_like(dy).bernoulli_().mul_(2).sub_(1)
-            vdy   = (dy*v).sum()
-            div   = (torch.autograd.grad(vdy, y, create_graph=True)[0]*v)\
+            vdy   = (dy * v).sum()
+            div   = (torch.autograd.grad(vdy, y, create_graph=True)[0] * v)\
                     .sum(-1, keepdim=True)
         return dy, -div
-
+        
 vf      = VF().to(device)
 odefunc = CNF_ODE(vf)
 scaler  = GradScaler('cuda', enabled=(device.type=="cuda"))
