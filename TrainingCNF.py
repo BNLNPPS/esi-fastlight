@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 # ---------------------------------------------------------------
-# TrainingCNF.py  (updated)
+# TrainingCNF.py  (prior weights FIXED)
 # Conditional CNF that learns p(x, y | cond) with *isotropic*
-# normalisation (one shared σ for x,y) so generated rings stay circular.
-#
-# Conditioning vector per event comes from primaries.csv:
-#   columns 2..7 (1-based) PLUS the last column (7 dims total), normalized.
-#
+# normalisation. Prior over (x',y') uses a fixed-weight mixture.
 # Saves:
-#   • cnf_condN_iso.pt   (vf weights + xy_mean + iso_std + param_mean + param_std + mix_logits)
+#   • cnf_condN_iso.pt   (vf weights + stats + fixed mix_weights)
 #   • counts.npy         (per-event pairs: [momentum_last, n_hits])
-#   • progress/epXXX.png (training snapshots, equal aspect)
+#   • progress/epXXX.png
 # ---------------------------------------------------------------
 import math, random, re, numpy as np, torch, torch.nn as nn
 from collections import defaultdict
@@ -24,7 +20,7 @@ from contextlib import nullcontext
 # ───────────────────── 0. CONFIG ──────────────────────────────────
 OPTICKS_FILE   = "opticks_hits_output.txt"
 PRIMARIES_CSV  = "primaries.csv"
-COND_COLS_1BASED = [2,3,4,5,6,7, -1]   # columns 2..7 + last (-1 means "last")
+COND_COLS_1BASED = [2,3,4,5,6,7, -1]   # columns 2..7 + last
 HIDDEN = 128
 BATCH, EPOCHS, PLOT_EVERY = 512, 200, 20
 SEED = 42
@@ -54,7 +50,6 @@ def parse_primaries(path):
             except ValueError:
                 continue
             ev = int(vals[0])
-            # map 1-based indices; -1 means "last column"
             sel = []
             for c in COND_COLS_1BASED:
                 if c == -1:
@@ -66,41 +61,37 @@ def parse_primaries(path):
 
 prim_map = parse_primaries(PRIMARIES_CSV)
 
-# Keep only events present in BOTH sources
+# Overlap & split
 ev_all = sorted(set(hits.keys()) & set(prim_map.keys()))
 if not ev_all:
     raise RuntimeError("No overlapping events between hits and primaries.csv")
 
-# Split events
 rng = np.random.default_rng(SEED)
-ev_all = np.array(ev_all)
-rng.shuffle(ev_all)
+ev_all = np.array(ev_all); rng.shuffle(ev_all)
 cut1, cut2 = int(.7*len(ev_all)), int(.85*len(ev_all))
 ev_train, ev_val = ev_all[:cut1], ev_all[cut1:cut2]
 
-# ── Build per-event (momentum_last, n_hits) and save as counts.npy
+# counts.npy: [momentum_last, n_hits] per event
 mom_last = np.array([prim_map[e][-1] for e in ev_all], dtype=np.float32)
 n_hits   = np.array([len(hits[e])    for e in ev_all], dtype=np.int32)
-np.save("counts.npy", np.stack([mom_last, n_hits], axis=1))  # shape (E,2)
+np.save("counts.npy", np.stack([mom_last, n_hits], axis=1))
 
 # ───────────────────── 3. NORMALISATIONS ──────────────────────────
-# isotropic mean+std for x,y from training only
 all_xy_train = np.vstack([np.asarray(hits[e], np.float32) for e in ev_train])
 xy_mean = all_xy_train.mean(0).astype(np.float32)
-iso_std = float(np.sqrt(((all_xy_train - xy_mean)**2).sum(1).mean() / 2))  # scalar
+iso_std = float(np.sqrt(((all_xy_train - xy_mean)**2).sum(1).mean() / 2))
 
-# conditioning parameters: mean/std from training events (per-dimension)
-param_train = np.stack([prim_map[e] for e in ev_train], axis=0)  # (Etrain, 7)
+param_train = np.stack([prim_map[e] for e in ev_train], axis=0)  # (Etr,7)
 param_mean  = param_train.mean(axis=0).astype(np.float32)
 param_std   = (param_train.std(axis=0) + 1e-7).astype(np.float32)
 
 def to_tensor(ev_subset):
     rows = []
     for e in ev_subset:
-        pts = (np.asarray(hits[e], np.float32) - xy_mean) / iso_std  # (Ni,2)
-        p   = (prim_map[e] - param_mean) / param_std                # (7,)
-        p_rep = np.repeat(p[None, :], len(pts), axis=0)             # (Ni,7)
-        rows.append(np.hstack([pts, p_rep]))                        # (Ni, 2+7)
+        pts = (np.asarray(hits[e], np.float32) - xy_mean) / iso_std
+        p   = (prim_map[e] - param_mean) / param_std
+        p_rep = np.repeat(p[None, :], len(pts), axis=0)
+        rows.append(np.hstack([pts, p_rep]))   # (Ni, 2+7)
     return torch.from_numpy(np.vstack(rows))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,8 +99,8 @@ torch.manual_seed(SEED)
 train, val = map(lambda es: to_tensor(es).to(device), (ev_train, ev_val))
 
 # ───────────────────── 4. MODEL DEFINITIONS ───────────────────────
-COND_DIM = 7  # from primaries
-STATE_DIM = 2 + COND_DIM  # x,y plus 7 conditioners
+COND_DIM = 7
+STATE_DIM = 2 + COND_DIM
 
 class VF(nn.Module):
     def __init__(self, d=STATE_DIM, h=HIDDEN):
@@ -118,23 +109,21 @@ class VF(nn.Module):
             nn.Linear(d+1, h), nn.SiLU(),
             nn.Linear(h,h),    nn.SiLU(),
             nn.Linear(h,h//2), nn.SiLU(),
-            nn.Linear(h//2, 2)  # predict drift only for x,y
+            nn.Linear(h//2, 2)
         )
     def forward(self, t, y):
         return self.net(torch.cat([y, t.expand(len(y),1)], 1))
 
 class CNF_ODE(nn.Module):
     def __init__(self, vf):
-        super().__init__()
-        self.vf = vf
+        super().__init__(); self.vf = vf
     def forward(self, t, states):
-        y, logp = states                    # y: (N, 2+COND_DIM)
+        y, logp = states
         y = y.detach().requires_grad_(True)
         with torch.enable_grad():
-            dy_xy = self.vf(t, y)           # (N,2)
-            zeros = torch.zeros_like(y[:, 2:])  # keep conditioners static
+            dy_xy = self.vf(t, y)
+            zeros = torch.zeros_like(y[:, 2:])
             dy    = torch.cat([dy_xy, zeros], -1)
-            # Hutchinson trace estimator (Rademacher)
             v     = torch.empty_like(dy).bernoulli_().mul_(2).sub_(1)
             vdy   = (dy*v).sum()
             div   = (torch.autograd.grad(vdy, y, create_graph=True)[0]*v)\
@@ -145,7 +134,7 @@ vf      = VF().to(device)
 odefunc = CNF_ODE(vf)
 scaler  = GradScaler('cuda', enabled=(device.type=="cuda"))
 
-# ── Latent prior over (x', y') with **learnable mixture weights** ─
+# ── Prior over (x', y') with FIXED mixture weights ────────────────
 class RingPrior(torch.distributions.Distribution):
     arg_constraints, has_rsample, EPS = {}, False, 1e-6
     def __init__(self, R=1.0, s=0.05, dev="cpu"):
@@ -159,7 +148,6 @@ class RingPrior(torch.distributions.Distribution):
         return -((r-self.R)**2)/(2*self.s**2) - torch.log(r+self.EPS) \
                - math.log(self.s*math.sqrt(2*math.pi))
 
-# Initialise ring radius from (normalised) data as a heuristic
 ring_R = torch.median(torch.sqrt((train[:, :2]**2).sum(-1))).item()
 ring   = RingPrior(ring_R, 0.05, device)
 center = torch.distributions.MultivariateNormal(torch.zeros(2,device=device),
@@ -167,14 +155,14 @@ center = torch.distributions.MultivariateNormal(torch.zeros(2,device=device),
 noise  = torch.distributions.MultivariateNormal(torch.zeros(2,device=device),
                                                 torch.eye(2,device=device)*3.0**2)
 
-# Learnable logits (init from 0.60/0.25/0.15)
-mix_logits = nn.Parameter(torch.log(torch.tensor([.60, .25, .15], device=device)))
+# FIXED logits (no gradients; not in optimizer)
+mix_logits = torch.log(torch.tensor([.60, .25, .15], device=device))
 
 class MixXY(nn.Module):
-    def __init__(self, comps, logits_param):
+    def __init__(self, comps, logits_tensor):
         super().__init__()
         self.c = comps
-        self.logits = logits_param
+        self.register_buffer("logits", logits_tensor)  # fixed buffer
     def weights(self):
         return torch.softmax(self.logits, 0)
     def sample(self, shape=torch.Size()):
@@ -196,12 +184,9 @@ class MixXY(nn.Module):
 xy_prior = MixXY([ring, center, noise], mix_logits)
 
 def prior_logp(z):
-    """Prior over latent (x',y') only; conditioners are not regularized."""
-    xy = z[..., :2]
-    return xy_prior.log_prob(xy)
+    return xy_prior.log_prob(z[..., :2])
 
 def forward_logp(x):
-    """log p(x) via CNF: log p(z_T[:2]) + log|det J|."""
     log0 = torch.zeros(x.size(0), 1, device=x.device)
     z_traj, logp_traj = odeint(
         odefunc, (x, log0),
@@ -209,19 +194,16 @@ def forward_logp(x):
         method="rk4", options={"step_size": 0.05},
         atol=3e-4, rtol=3e-4
     )
-    z_T    = z_traj[-1]                 # (N, 2+COND_DIM)
-    logp_T = logp_traj[-1].squeeze(-1)  # (N,)
+    z_T    = z_traj[-1]
+    logp_T = logp_traj[-1].squeeze(-1)
     return prior_logp(z_T) + logp_T
 
 # ───────────────────── 5. TRAINING LOOP ────────────────────────────
 Path("progress").mkdir(exist_ok=True)
 sample_evs = random.sample(list(ev_val), k=min(2, len(ev_val)))
 amp_ctx = (autocast(device_type='cuda') if device.type=='cuda' else nullcontext())
-opt = torch.optim.AdamW(
-    [{"params": vf.parameters()},
-     {"params": [mix_logits], "weight_decay": 0.0}],
-    lr=3e-4
-)
+
+opt = torch.optim.AdamW([{"params": vf.parameters()}], lr=3e-4)  # ← no prior weights
 rand_id = lambda d: torch.randint(0, d.size(0), (BATCH,), device=device)
 
 def plot_epoch(ep):
@@ -231,13 +213,11 @@ def plot_epoch(ep):
         N = len(real_xy)
         if N == 0: 
             continue
-        # conditioning vector for this event (normalised), repeated N times
         p = (prim_map[ev] - param_mean) / param_std
-        p_t = torch.from_numpy(np.repeat(p[None,:], N, axis=0)).to(device)  # (N,7)
+        p_t = torch.from_numpy(np.repeat(p[None,:], N, axis=0)).to(device)
 
-        # sample z_xy from learned prior, concatenate conditioners, invert flow
-        z_xy = xy_prior.sample((N,)).to(device)         # (N,2)
-        z    = torch.cat([z_xy, p_t], 1)                # (N, 2+7)
+        z_xy = xy_prior.sample((N,)).to(device)
+        z    = torch.cat([z_xy, p_t], 1)
         with torch.no_grad(), (autocast(device_type='cuda') if device.type=='cuda' else nullcontext()):
             x_inv, _ = odeint(
                 odefunc, (z, torch.zeros_like(z[:, :1])),
@@ -267,18 +247,15 @@ for ep in range(EPOCHS):
 
     if ep % PLOT_EVERY == 0:
         plot_epoch(ep)
-        with torch.no_grad():
-            w = torch.softmax(mix_logits, 0).detach().cpu().numpy()
-        print(f"Epoch {ep:03d} | loss {loss.item():.4f} | weights ring/center/noise = {w}")
+        w = torch.softmax(mix_logits, 0).detach().cpu().numpy()
+        print(f"Epoch {ep:03d} | loss {loss.item():.4f} | FIXED weights ring/center/noise = {w}")
 
 # ───────────────────── 6. SAVE ────────────────────────────────────
 torch.save(dict(
     vf_state_dict=vf.state_dict(),
-    xy_mean=xy_mean,
-    iso_std=iso_std,
-    param_mean=param_mean,
-    param_std=param_std,
-    mix_logits=mix_logits.detach().cpu().numpy(),
+    xy_mean=xy_mean, iso_std=iso_std,
+    param_mean=param_mean, param_std=param_std,
+    mix_weights=torch.softmax(mix_logits, 0).detach().cpu().numpy(),
     cond_cols_1based=COND_COLS_1BASED
 ), "cnf_condN_iso.pt")
-print("Saved cnf_condN_iso.pt (incl. conditioning stats + mix_logits) and counts.npy")
+print("Saved cnf_condN_iso.pt (fixed prior weights) and counts.npy")
