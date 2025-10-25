@@ -32,7 +32,7 @@ PRIMARIES_CSV = "primaries.csv"
 COND_COLS_1BASED = [2, 3, 4, 5, 6, 7, -1]
 
 # Cherenkov transform settings
-CERENKOV_N = 1.33          # refractive index (e.g., water)
+CERENKOV_N = 1.04          # refractive index (e.g., water)
 CERENKOV_SCALE = 1.0       # overall multiplicative scale for tan(theta_c)
 DEFAULT_PID = 11           # assume electron if we can't infer a PDG from the row
 
