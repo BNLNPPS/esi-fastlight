@@ -4,6 +4,7 @@
 # (KE->Cherenkov ring-proportional transform on last conditioner)
 # Ring radius R(cond), ring thickness s(cond), and center σ(cond)
 # are all learned by small MLP heads.
+# NEW: Poisson count head λ(cond) learns p(N | cond).
 # Inference/plots at the end use ONLY validation events.
 # ---------------------------------------------------------------
 
@@ -20,7 +21,7 @@ from contextlib import nullcontext
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm  # <- for log-scaled hitmaps
+from matplotlib.colors import LogNorm  # log-scaled hitmaps
 
 from torchdiffeq import odeint
 
@@ -36,13 +37,13 @@ CERENKOV_N = 1.04          # refractive index (e.g., water)
 CERENKOV_SCALE = 1.0       # overall multiplicative scale for tan(theta_c)
 DEFAULT_PID = 11           # assume electron if we can't infer a PDG from the row
 
-# PDG -> mass [GeV] (common cases; extend if needed)
+# PDG -> mass [GeV]
 PDG_MASS_GEV = {
-    11: 0.00051099895,  -11: 0.00051099895,  # e-/e+
-    13: 0.1056583755,   -13: 0.1056583755,   # mu-/mu+
-    211: 0.13957039,    -211: 0.13957039,    # pi+/pi-
-    321: 0.493677,      -321: 0.493677,      # K+/K-
-    2212: 0.9382720813, 2112: 0.9395654133,  # p, n
+    11: 0.00051099895,  -11: 0.00051099895,
+    13: 0.1056583755,   -13: 0.1056583755,
+    211: 0.13957039,    -211: 0.13957039,
+    321: 0.493677,      -321: 0.493677,
+    2212: 0.9382720813, 2112: 0.9395654133,
 }
 
 HIDDEN = 20
@@ -50,8 +51,8 @@ BATCH, EPOCHS, PLOT_EVERY = 512, 200, 20
 SEED = 42
 
 # Loss / training knobs
-RING_S = 0.01        # baseline ring thickness s_0 (now only initial value; learned per-cond by s_net)
-CEN_SIGMA = 0.01     # baseline center sigma σ_0 (now only initial value; learned per-cond by sigma_net)
+RING_S = 0.01
+CEN_SIGMA = 0.01
 RLOSS_LAMBDA = 0.05
 CLOSS_LAMBDA = 0.10
 ANCHOR_LAMBDA = 0.10
@@ -62,7 +63,7 @@ MIX_TARGET = torch.tensor([0.60, 0.25, 0.15], dtype=torch.float32)
 MIX_PRIOR_LAMBDA = 0.05
 LOGITS_WARMUP_EPOCHS = 50
 
-# Warm-up to lock μ(cond) as translation early
+# Warm-up to lock μ(cond) early
 CENTER_WARMUP_EPOCHS = 10
 
 # μ(cond) supervised pre-train (centroids)
@@ -70,7 +71,7 @@ MU_PRETRAIN_STEPS = 2000
 MU_PRETRAIN_BATCH = 1024
 MU_PRETRAIN_LR    = 5e-3
 
-# Isotropy penalty (keeps circles circular after inverse)
+# Isotropy penalty
 ISO_LAMBDA = 1e-2
 ISO_EPS    = 0.25
 ISO_K      = 24
@@ -85,16 +86,23 @@ VF_LR = 3e-4
 R_LR  = 1e-3
 MU_LR = 3e-3
 LOGITS_LR = 2e-3
-S_LR = R_LR          # learning rate for s(cond)
-SIGMA_LR = R_LR      # learning rate for σ(cond)
+S_LR = R_LR
+SIGMA_LR = R_LR
 WEIGHT_DECAY = 1e-4
+
+# NEW: Poisson count head hyperparams
+COUNT_LR = 2e-3
+COUNT_LAMBDA = 0.05       # weight for count NLL in total loss
+EVENT_BATCH = 256         # minibatch of events per step for count loss
+POISSON_MIN_LAMBDA = 1e-6 # clamp to avoid log(0)
+POISSON_MAX_LAMBDA = 1e6  # safety clamp during training/sampling
+SAMPLE_MAX_N = 100000     # hard cap for sampled count at inference
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
 
 # ───────────────────── Cherenkov helper ───────────────────────────
 def _infer_pdg(vals):
-    """Try to infer PDG code from second column (1-based col=2). If missing/invalid -> None."""
     if len(vals) < 2:
         return None
     try:
@@ -104,11 +112,6 @@ def _infer_pdg(vals):
         return None
 
 def ke_to_ring_scale(ke_gev, pid=None, n=CERENKOV_N, scale=CERENKOV_SCALE):
-    """
-    Map kinetic energy [GeV] -> number proportional to Cherenkov ring radius.
-      r ∝ tan(theta_c),   cos(theta_c) = 1/(n * beta), beta = sqrt(1 - 1/gamma^2), gamma = 1 + T/m.
-    Below threshold (n*beta <= 1) => 0.
-    """
     m = PDG_MASS_GEV.get(pid if pid is not None else DEFAULT_PID, PDG_MASS_GEV[DEFAULT_PID])
     T = max(float(ke_gev), 0.0)
     gamma = 1.0 + (T / max(m, 1e-12))
@@ -139,11 +142,6 @@ for ln in open(OPTICKS_FILE, "r"):
 
 # ───────────────────── 2. LOAD PRIMARIES (CONDITIONERS) ───────────
 def parse_primaries(path):
-    """
-    Returns:
-      prim_map[e] -> np.array shape (7,) with last dim = transformed KE -> ring-proportional number
-      ke_raw_map[e] -> original KE [GeV] from last column
-    """
     prim, ke_raw_map = {}, {}
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing {path}")
@@ -157,9 +155,7 @@ def parse_primaries(path):
             except ValueError:
                 continue
             ev = int(vals[0])
-
             pid = _infer_pdg(vals)
-
             sel = []
             for c in COND_COLS_1BASED:
                 if c == -1:
@@ -184,13 +180,13 @@ ev_all = np.array(ev_all); rng.shuffle(ev_all)
 cut1, cut2 = int(.7 * len(ev_all)), int(.85 * len(ev_all))
 ev_train, ev_val = ev_all[:cut1], ev_all[cut1:cut2]
 
-# counts.npy: [KE_raw_in_GeV, n_hits]  (still save the original KE here)
+# counts.npy: [KE_raw_in_GeV, n_hits]
 ke_last_raw = np.array([ke_raw_map[e] for e in ev_all], dtype=np.float32)
-n_hits = np.array([len(hits[e]) for e in ev_all], dtype=np.int32)
-np.save("counts.npy", np.stack([ke_last_raw, n_hits], axis=1))
+n_hits_arr = np.array([len(hits[e]) for e in ev_all], dtype=np.int32)
+np.save("counts.npy", np.stack([ke_last_raw, n_hits_arr], axis=1))
 
 # ───────────────────── 3. NORMALISATIONS / EXTENT ─────────────────
-all_xy_train = np.vstack([np.asarray(hits[e], np.float32) for e in ev_train])
+all_xy_train = np.vstack([np.asarray(hits[e], np.float32) for e in ev_train if len(hits[e])>0])
 xy_mean = all_xy_train.mean(0).astype(np.float32)
 iso_std = float(np.sqrt(((all_xy_train - xy_mean) ** 2).sum(1).mean() / 2))
 
@@ -256,12 +252,23 @@ if not centroid_pairs:
 cent_cond = torch.from_numpy(np.stack([p for p,_ in centroid_pairs], 0)).to(device)
 cent_xy   = torch.from_numpy(np.stack([c for _,c in centroid_pairs], 0)).to(device)
 
+# ───────────────────── 3c. EVENT-LEVEL DATA FOR COUNT HEAD ────────
+# Use ALL training events (even with zero hits) for Poisson supervision.
+train_event_list = [int(e) for e in ev_train if e in prim_map]
+train_event_cond = torch.from_numpy(
+    np.stack([ (prim_map[e] - param_mean)/param_std for e in train_event_list ], axis=0)
+).to(device).float()
+train_event_counts = torch.from_numpy(
+    np.array([ len(hits[e]) for e in train_event_list ], dtype=np.float32)
+).to(device)
+
+train_mean_count = float(train_event_counts.mean().item())
+
 # ───────────────────── 4. MODEL ───────────────────────────────────
 COND_DIM  = 7
 STATE_DIM = 2 + COND_DIM
 
 class VF(nn.Module):
-    """Vector field on centered coords. Input = [(xy-μ(cond)), cond, t]; output = d(xy)/dt."""
     def __init__(self, d=STATE_DIM, h=HIDDEN):
         super().__init__()
         self.net = nn.Sequential(
@@ -278,29 +285,25 @@ class VF(nn.Module):
         return self.net(inp)
 
 class CNF_ODE(nn.Module):
-    """ODE using centered inputs for VF; enables-grad internally for divergence."""
     def __init__(self, vf, mu_fn):
         super().__init__(); self.vf = vf; self.mu_fn = mu_fn
         self.allow_grad_wrt_y = False
-        self.compute_divergence = True  # can be disabled during sampling/plotting
+        self.compute_divergence = True
     def forward(self, t, states):
         y, logp = states
         if self.allow_grad_wrt_y:
             y = y.requires_grad_(True)
         else:
             y = y.detach().requires_grad_(True)
-
         xy, cond = y[:, :2], y[:, 2:]
         mu = self.mu_fn(cond)
         inp = torch.cat([xy - mu, cond, t.expand(len(y), 1)], 1)
-
         if not self.compute_divergence:
             dy_xy = self.vf(inp)
             zeros = torch.zeros_like(cond)
             dy = torch.cat([dy_xy, zeros], -1)
             div = torch.zeros(len(y), 1, device=y.device, dtype=y.dtype)
             return dy, -div
-
         with torch.enable_grad():
             dy_xy = self.vf(inp)
             zeros = torch.zeros_like(cond)
@@ -311,19 +314,11 @@ class CNF_ODE(nn.Module):
             return dy, -div
 
 class CondRingPrior(nn.Module):
-    """
-    Ring-shaped conditional prior with learnable:
-      - R(cond): ring radius (via R_net)
-      - s(cond): ring thickness (via S_net)
-      - μ(cond): ring center (via mu_net)
-    Parameterizations ensure R(cond)≈base_R and s(cond)≈base_s at init (zero heads).
-    """
     EPS = 1e-6
     def __init__(self, cond_dim, base_R=1.0, base_s=0.05, hidden=32):
         super().__init__()
         self.base_R = float(base_R)
         self.base_s = float(base_s)
-
         self.R_net = nn.Sequential(
             nn.Linear(cond_dim, hidden), nn.SiLU(),
             nn.Linear(hidden, hidden),   nn.SiLU(),
@@ -339,47 +334,33 @@ class CondRingPrior(nn.Module):
             nn.Linear(hidden, hidden),   nn.SiLU(),
             nn.Linear(hidden, 2)
         )
-
-        # zero last layers so initial predictions equal the bases (exp(0)=1)
         with torch.no_grad():
             for net in (self.R_net, self.S_net, self.mu_net):
                 last = [m for m in net.modules() if isinstance(m, nn.Linear)][-1]
                 nn.init.zeros_(last.weight); nn.init.zeros_(last.bias)
-
     def R(self, cond):
         delta = 0.1 * self.R_net(cond).squeeze(-1)
         return torch.clamp(self.base_R * torch.exp(delta), min=1e-3)
-
     def S(self, cond):
         delta = 0.1 * self.S_net(cond).squeeze(-1)
         return torch.clamp(self.base_s * torch.exp(delta), min=1e-4)
-
     def mu(self, cond):
         return self.mu_net(cond)
-
     def sample(self, cond):
         N = cond.size(0)
         theta = torch.rand(N, device=cond.device) * (2 * math.pi)
         r = self.R(cond) + self.S(cond) * torch.randn(N, device=cond.device)
         xy = torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=-1)
         return xy + self.mu(cond)
-
     def log_prob(self, x, cond):
-        """
-        Approx ring: p(r|cond) ~ N(R(cond), S(cond)^2) with Jacobian term -log r.
-        """
         xc = x - self.mu(cond)
-        r = torch.sqrt((xc ** 2).sum(-1) + self.EPS)        # (N,)
-        R = self.R(cond)                                     # (N,)
-        S = self.S(cond)                                     # (N,)
+        r = torch.sqrt((xc ** 2).sum(-1) + self.EPS)
+        R = self.R(cond)
+        S = self.S(cond)
         return -((r - R) ** 2) / (2 * S ** 2) - torch.log(r + self.EPS) \
                - torch.log(S * math.sqrt(2 * math.pi) + self.EPS)
 
 class CondCenterGaussianVar(nn.Module):
-    """
-    Isotropic Gaussian around μ(cond) with learnable σ(cond) via a small MLP.
-    Init σ(cond)≈base_sigma for all cond (zero head).
-    """
     def __init__(self, mu_fn, base_sigma=0.01, cond_dim=7, hidden=32):
         super().__init__()
         self.mu_fn = mu_fn
@@ -392,20 +373,16 @@ class CondCenterGaussianVar(nn.Module):
         with torch.no_grad():
             last = [m for m in self.sigma_net.modules() if isinstance(m, nn.Linear)][-1]
             nn.init.zeros_(last.weight); nn.init.zeros_(last.bias)
-
     def sigma(self, cond):
         delta = 0.1 * self.sigma_net(cond).squeeze(-1)
         return torch.clamp(self.base_sigma * torch.exp(delta), min=1e-5)
-
     def sample(self, cond):
         sig = self.sigma(cond)[:, None]
         return self.mu_fn(cond) + sig * torch.randn(cond.size(0), 2, device=cond.device)
-
     def log_prob(self, x, cond):
         mu = self.mu_fn(cond)
         sig = self.sigma(cond)
-        diff2 = ((x - mu) ** 2).sum(-1)                                  # (N,)
-        # 2D isotropic gaussian log prob: -||x-μ||^2/(2σ^2) - log(2πσ^2)
+        diff2 = ((x - mu) ** 2).sum(-1)
         return -0.5 * (diff2 / (sig ** 2)) - torch.log(2 * math.pi * (sig ** 2))
 
 class CondMixXY_LearnedWeights(nn.Module):
@@ -422,7 +399,7 @@ class CondMixXY_LearnedWeights(nn.Module):
             for m in self.logits_net.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
-            self.logits_net[-1].bias.copy_(torch.log(torch.tensor(init_probs)))
+            self.logits_net[-1].bias.copy_((torch.log(torch.tensor(init_probs))))
     def weights(self, cond): return torch.softmax(self.logits_net(cond), dim=-1)
     def log_weights(self, cond): return torch.log_softmax(self.logits_net(cond), dim=-1)
     def sample(self, cond, return_comp=False):
@@ -444,7 +421,28 @@ class CondMixXY_LearnedWeights(nn.Module):
         logw = self.log_weights(cond)
         return torch.logsumexp(LP + logw, dim=-1)
 
+# NEW: Poisson count head λ(cond)
+class CountPoissonHead(nn.Module):
+    def __init__(self, cond_dim, hidden=32, init_mean=10.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cond_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden),   nn.SiLU(),
+            nn.Linear(hidden, 1)
+        )
+        with torch.no_grad():
+            for m in self.net.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+            self.net[-1].bias.fill_(math.log(max(init_mean, 1e-3)))
+    def lam(self, cond):
+        out = self.net(cond).squeeze(-1)
+        lam = torch.exp(out)
+        lam = torch.clamp(lam, min=POISSON_MIN_LAMBDA, max=POISSON_MAX_LAMBDA)
+        return lam
+
 # Assemble
+COND_DIM  = 7
 vf = VF().to(device)
 ring   = CondRingPrior(cond_dim=COND_DIM, base_R=ring_R_init, base_s=RING_S, hidden=32).to(device)
 center = CondCenterGaussianVar(ring.mu, base_sigma=CEN_SIGMA, cond_dim=COND_DIM, hidden=32).to(device)
@@ -452,6 +450,7 @@ noise  = torch.distributions.MultivariateNormal(torch.zeros(2, device=device),
                                                 torch.eye(2, device=device) * (3.0 ** 2))
 xy_prior = CondMixXY_LearnedWeights(ring, center, noise, COND_DIM, hidden=32).to(device)
 odefunc = CNF_ODE(vf, ring.mu).to(device)
+count_head = CountPoissonHead(COND_DIM, hidden=32, init_mean=train_mean_count).to(device)
 
 scaler = GradScaler(enabled=(device.type == "cuda"))
 
@@ -469,6 +468,11 @@ def forward_logp(x):
     z_T    = z_traj[-1]
     logp_T = logp_traj[-1].squeeze(-1)
     return prior_logp(z_T) + logp_T, z_T
+
+# Poisson NLL for counts
+def poisson_nll(lam, N_obs):
+    lam = torch.clamp(lam, min=POISSON_MIN_LAMBDA, max=POISSON_MAX_LAMBDA)
+    return (lam - N_obs * torch.log(lam) + torch.lgamma(N_obs + 1.0)).mean()
 
 # ───────────────────── 4b. PRE-TRAIN μ(cond) ON CENTROIDS ─────────
 print(f"[mu-pretrain] {len(centroid_pairs)} event centroids")
@@ -492,7 +496,7 @@ print("[mu-pretrain] done.")
 
 # ───────────────────── 5. TRAINING LOOP ───────────────────────────
 Path("progress").mkdir(exist_ok=True)
-sample_evs = random.sample(list(ev_val), k=min(2, len(ev_val)))  # <- validation-only for progress plots
+sample_evs = random.sample(list(ev_val), k=min(2, len(ev_val)))  # validation-only progress
 
 amp_ctx = (autocast(device_type='cuda') if device.type == 'cuda' else nullcontext())
 opt = torch.optim.AdamW([
@@ -502,6 +506,7 @@ opt = torch.optim.AdamW([
     {"params": ring.mu_net.parameters(),           "lr": MU_LR,     "name": "mu"},
     {"params": center.sigma_net.parameters(),      "lr": SIGMA_LR,  "name": "sigma"},
     {"params": xy_prior.logits_net.parameters(),   "lr": LOGITS_LR, "name": "logits"},
+    {"params": count_head.parameters(),            "lr": COUNT_LR,  "name": "count"},
 ], weight_decay=WEIGHT_DECAY)
 
 vf_pg     = next(pg for pg in opt.param_groups if pg.get("name","") == "vf")
@@ -520,27 +525,23 @@ def plot_epoch(ep):
         p  = (prim_map[ev] - param_mean) / param_std
         p_t = torch.from_numpy(np.repeat(p[None, :], N, axis=0)).to(device)
         z_xy = xy_prior.sample(p_t); z = torch.cat([z_xy, p_t], 1)
-        odefunc.compute_divergence = False  # fast inverse map
+        odefunc.compute_divergence = False
         x_inv, _ = odeint(odefunc, (z, torch.zeros_like(z[:, :1])),
                            torch.tensor([1., 0.], device=device),
                            method="rk4", options={"step_size": 0.05}, atol=3e-4, rtol=3e-4)
         odefunc.compute_divergence = True
         gen_xy = (x_inv[-1][:, :2].detach().cpu().numpy() * iso_std + xy_mean)
-
         ax = fig.add_subplot(1, 2, j+1)
         extent = DATA_EXTENT
         H1, _, _ = np.histogram2d(real_xy[:,0], real_xy[:,1], bins=100,
                                   range=[[extent[0], extent[1]], [extent[2], extent[3]]])
         H2, _, _ = np.histogram2d(gen_xy[:,0], gen_xy[:,1], bins=100,
                                   range=[[extent[0], extent[1]], [extent[2], extent[3]]])
-
-        # Log-scaled overlays (mask zeros)
         H1 = H1.T; H2 = H2.T
         H1m = np.where(H1 > 0, H1, np.nan)
         H2m = np.where(H2 > 0, H2, np.nan)
         vmax = float(np.nanmax([np.nanmax(H1m), np.nanmax(H2m)]))
         norm = LogNorm(vmin=1.0, vmax=max(vmax, 1.0))
-
         ax.imshow(H1m, origin="lower", extent=extent, aspect="equal", norm=norm)
         ax.imshow(H2m, origin="lower", extent=extent, aspect="equal", norm=norm, alpha=0.6)
         ax.set_title(f"Event {ev} (N={N})"); ax.set_xlabel("x"); ax.set_ylabel("y")
@@ -556,15 +557,16 @@ def sym_kl(p, q):
     return 0.5 * (kl_pq + kl_qp)
 
 theta_iso = torch.linspace(0, 2*math.pi, ISO_K+1, device=device)[:-1]
-unit_iso = torch.stack([theta_iso.cos(), theta_iso.sin()], -1)  # (K,2)
+unit_iso = torch.stack([theta_iso.cos(), theta_iso.sin()], -1)
 
 for ep in range(EPOCHS):
     vf_pg["lr"]     = 0.0 if ep < CENTER_WARMUP_EPOCHS else vf_pg["base_lr"]
     logits_pg["lr"] = 0.0 if ep < LOGITS_WARMUP_EPOCHS else logits_pg["base_lr"]
 
-    vf.train(); ring.train(); xy_prior.train(); center.train()
+    vf.train(); ring.train(); xy_prior.train(); center.train(); count_head.train()
     opt.zero_grad(set_to_none=True)
 
+    # ---- Per-hit likelihood step
     idx = rand_id(train); x = train[idx]
     seen_train_events.update(train_ev_ids[idx.detach().cpu().numpy()].tolist())
 
@@ -590,7 +592,6 @@ for ep in range(EPOCHS):
         sum_mu = torch.zeros(G, 2, device=x.device, dtype=torch.float32)
         sum_x  = torch.zeros(G, 2, device=x.device, dtype=torch.float32)
         cnts   = torch.zeros(G, 1, device=x.device, dtype=torch.float32)
-
         sum_z.index_add_(0, inv, zxy)
         sum_mu.index_add_(0, inv, mu_i)
         sum_x.index_add_(0, inv, x[:, :2].float())
@@ -637,10 +638,20 @@ for ep in range(EPOCHS):
                                 method="rk4", options={"step_size":0.05}, atol=3e-4, rtol=3e-4)
         odefunc.compute_divergence = True
         x_ring = x_ring_traj[-1][:,:2].reshape(G, ISO_K, 2)
-        rad = ((x_ring - x_ctr[:, None, :])**2).sum(-1).sqrt()      # (G,K)
+        rad = ((x_ring - x_ctr[:, None, :])**2).sum(-1).sqrt()
         iso_pen = ISO_LAMBDA * rad.std(dim=1).mean()
 
-        loss = nll.float() + rloss + closs + vpen + mix_term + anchor + iso_pen
+        # ---- Event-level Poisson loss step
+        if len(train_event_list) > 0:
+            ev_idx = torch.randint(0, len(train_event_list), (min(EVENT_BATCH, len(train_event_list)),), device=device)
+            cond_ev = train_event_cond[ev_idx]
+            N_ev = train_event_counts[ev_idx]
+            lam_ev = count_head.lam(cond_ev)
+            count_loss = poisson_nll(lam_ev, N_ev) * COUNT_LAMBDA
+        else:
+            count_loss = torch.tensor(0.0, device=device)
+
+        loss = nll.float() + rloss + closs + vpen + mix_term + anchor + iso_pen + count_loss
 
     scaler.scale(loss).backward()
     scaler.step(opt); scaler.update()
@@ -656,12 +667,20 @@ for ep in range(EPOCHS):
         mix_kl_val = mix_kl.item()
         anchor_val = ((x_mu - x_ctr)**2).mean().item()
         iso_val = rad.std(dim=1).mean().item()
+        if len(train_event_list) > 0:
+            dbg_lam = lam_ev.mean().item()
+            dbg_N   = N_ev.mean().item()
+        else:
+            dbg_lam = float('nan'); dbg_N = float('nan')
 
-    if ep % PLOT_EVERY == 0: plot_epoch(ep)
+    if ep % PLOT_EVERY == 0:
+        plot_epoch(ep)
 
     print(f"Epoch {ep:03d} | loss {loss.item():.4f} | nll {nll.item():.4f} "
           f"| rloss {rloss.item():.4f} | closs {closs.item():.4f} | anchor {anchor_val:.4f} "
-          f"| iso {iso_val:.4f} | mixKL {mix_kl_val:.4f} | median r_lat {med_r:.3f} vs mean R(cond) {mean_R:.3f} "
+          f"| iso {iso_val:.4f} | mixKL {mix_kl_val:.4f} | count_loss {count_loss.item():.4f} "
+          f"| λ_ev_mean {dbg_lam:.2f} vs N_ev_mean {dbg_N:.2f} "
+          f"| median r_lat {med_r:.3f} vs mean R(cond) {mean_R:.3f} "
           f"| s(cond)_mean {mean_s:.4f} | sigma(cond)_mean {mean_sigma:.4f} "
           f"| center_err {c_err:.3f} | ||v0||_rms {vnorm0:.4f} "
           f"| mean weights [ring,center,noise] = {w_mean}")
@@ -670,8 +689,9 @@ for ep in range(EPOCHS):
 torch.save(dict(
     vf_state_dict=vf.state_dict(),
     ring_state_dict=ring.state_dict(),
-    center_state_dict=center.state_dict(),  # <- save σ(cond) head
+    center_state_dict=center.state_dict(),
     logits_state_dict=xy_prior.logits_net.state_dict(),
+    count_head_state_dict=count_head.state_dict(),   # NEW
     xy_mean=xy_mean,
     iso_std=iso_std,
     param_mean=param_mean,
@@ -680,7 +700,7 @@ torch.save(dict(
     ring_base_R=ring_R_init,
     ring_base_s=RING_S,
     center_base_sigma=CEN_SIGMA,
-    prior_kind="cond_ring_mixture_equivariant_iso_with_learnable_widths",
+    prior_kind="cond_ring_mixture_equivariant_iso_with_learnable_widths_and_poisson_counts",
     mix_target=MIX_TARGET.numpy(),
     mix_prior_lambda=MIX_PRIOR_LAMBDA,
     logits_warmup_epochs=LOGITS_WARMUP_EPOCHS,
@@ -694,14 +714,19 @@ torch.save(dict(
     iso_k=ISO_K,
     cherenkov_n=CERENKOV_N,
     cherenkov_scale=CERENKOV_SCALE,
-    ke_transform_note="Last conditioner column is KE[GeV] transformed to ring-proportional scale via tan(theta_c)."
+    train_mean_count=train_mean_count,
 ), "cnf_condN_condRing.pt")
 
 print("Saved cnf_condN_condRing.pt and counts.npy")
 
 # ───────────────────── 7. (SAMPLER) ───────────────────────────────
 @torch.no_grad()
-def sample_event(cond_raw, N=200, ckpt_path="cnf_condN_condRing.pt", dev=device, max_resample=5):
+def sample_event(cond_raw, N=None, sample_N=True, ckpt_path="cnf_condN_condRing.pt",
+                 dev=device, max_resample=5):
+    """
+    If sample_N is True and N is None, sample N ~ Poisson(λ(cond)).
+    Returns (xy array, N_used).
+    """
     ckpt = torch.load(ckpt_path, map_location=dev if dev.type=="cuda" else "cpu", weights_only=False)
     vf_s = VF().to(dev); vf_s.load_state_dict(ckpt["vf_state_dict"])
     ring_s = CondRingPrior(COND_DIM, base_R=ckpt["ring_base_R"], base_s=ckpt["ring_base_s"], hidden=32).to(dev)
@@ -713,6 +738,9 @@ def sample_event(cond_raw, N=200, ckpt_path="cnf_condN_condRing.pt", dev=device,
                                                       torch.eye(2, device=dev) * (3.0 ** 2))
     xy_prior_s = CondMixXY_LearnedWeights(ring_s, center_s, noise_s, COND_DIM, hidden=32).to(dev)
     xy_prior_s.logits_net.load_state_dict(ckpt["logits_state_dict"])
+    count_head_s = CountPoissonHead(COND_DIM, hidden=32, init_mean=ckpt.get("train_mean_count", 10.0)).to(dev)
+    if "count_head_state_dict" in ckpt:
+        count_head_s.load_state_dict(ckpt["count_head_state_dict"])
     odefunc_s = CNF_ODE(vf_s, ring_s.mu).to(dev)
 
     xy_mean_s = torch.tensor(ckpt["xy_mean"], device=dev)
@@ -721,14 +749,26 @@ def sample_event(cond_raw, N=200, ckpt_path="cnf_condN_condRing.pt", dev=device,
     p_std_s   = torch.tensor(ckpt["param_std"],  device=dev)
     extent    = ckpt.get("data_extent", None)
 
-    p = (torch.tensor(cond_raw, dtype=torch.float32, device=dev) - p_mean_s) / p_std_s
-    p = p.repeat(N, 1)
+    p_single = (torch.tensor(cond_raw, dtype=torch.float32, device=dev) - p_mean_s) / p_std_s
+
+    # Decide N
+    if sample_N and N is None:
+        lam = count_head_s.lam(p_single[None, :]).squeeze(0)
+        N_used = int(torch.poisson(lam.clamp(max=POISSON_MAX_LAMBDA)).item())
+        N_used = max(0, min(N_used, SAMPLE_MAX_N))
+    else:
+        N_used = int(N if N is not None else 0)
+
+    if N_used == 0:
+        return np.zeros((0, 2), dtype=np.float32), 0
+
+    p = p_single.repeat(N_used, 1)
 
     z_xy, comp_idx = xy_prior_s.sample(p, return_comp=True)
     z = torch.cat([z_xy, p], dim=1)
 
     odefunc_s.compute_divergence = False
-    x_inv, _ = odeint(odefunc_s, (z, torch.zeros(N,1, device=dev)),
+    x_inv, _ = odeint(odefunc_s, (z, torch.zeros(N_used,1, device=dev)),
                       torch.tensor([1., 0.], device=dev),
                       method="rk4", options={"step_size": 0.05}, atol=3e-4, rtol=3e-4)
     odefunc_s.compute_divergence = True
@@ -756,11 +796,10 @@ def sample_event(cond_raw, N=200, ckpt_path="cnf_condN_condRing.pt", dev=device,
         xy[:,0] = torch.clamp(xy[:,0], xmin, xmax)
         xy[:,1] = torch.clamp(xy[:,1], ymin, ymax)
 
-    return xy.detach().cpu().numpy()
+    return xy.detach().cpu().numpy(), N_used
 
 # ───────────────────── 8. HITMAPS (VALIDATION-ONLY) ───────────────
 def _first_n_evs_from_set(ev_set, n=10):
-    """Return up to n events from a given set (e.g., ev_val) that have hits and primaries."""
     evs = []
     for ev in ev_set:
         if ev in prim_map and ev in hits and len(hits[ev]) > 0:
@@ -794,14 +833,14 @@ for k, ev in enumerate(evs_to_plot, start=1):
     real_xy = np.asarray(hits[ev], dtype=np.float32)
     if real_xy.size == 0: continue
     cond_raw = prim_map[ev]
-    gen_xy = sample_event(cond_raw, N=len(real_xy), ckpt_path=_ckpt_path, dev=device)
+    gen_xy, N_gen = sample_event(cond_raw, N=None, sample_N=True, ckpt_path=_ckpt_path, dev=device)
     extent = DATA_EXTENT
 
     fig = plt.figure(figsize=(10, 4.5))
     ax1 = fig.add_subplot(1, 2, 1)
     ax2 = fig.add_subplot(1, 2, 2)
     _draw_hitmap(ax1, real_xy, extent, bins=100, vmax=None, title=f"Real VAL event {ev} (N={len(real_xy)})")
-    _draw_hitmap(ax2, gen_xy,  extent, bins=100, vmax=None, title=f"Generated (same cond, VAL)")
+    _draw_hitmap(ax2, gen_xy,  extent, bins=100, vmax=None, title=f"Generated VAL (N̂={N_gen})")
     fig.tight_layout(); out_path = Path("hitmap")/f"hitmap_pair_{k:02d}_ev{ev}_VAL.png"
     fig.savefig(out_path, dpi=160); plt.close(fig)
     print(f"[hitmap] saved {out_path}")
@@ -819,9 +858,11 @@ def ring_responsibility(zxy, cond):
 
 @torch.no_grad()
 def diagnose_event(ev):
-    if ev not in hits or len(hits[ev]) == 0 or ev not in prim_map:
+    if ev not in hits or ev not in prim_map:
         print(f"[diag] skip ev {ev}"); return
     pts = (np.asarray(hits[ev], np.float32) - xy_mean) / iso_std
+    if len(pts) == 0:
+        print(f"[diag] VAL ev {ev}: no hits"); return
     p = (prim_map[ev] - param_mean) / param_std
     N = len(pts)
     y0 = torch.from_numpy(np.hstack([pts, np.repeat(p[None,:], N, axis=0)])).to(device).float()
@@ -837,14 +878,15 @@ def diagnose_event(ev):
     r_all  = torch.sqrt(((zxy - ring.mu(cond)) ** 2).sum(-1))
     med_all = r_all.median().item()
     gamma = ring_responsibility(zxy, cond); mask = gamma > 0.5
+    lam_pred = count_head.lam(cond[:1]).mean().item()
     if mask.any():
         med_ring = r_all[mask].median().item()
         print(f"[diag] VAL ev {ev}: median r(all) {med_all:.3f}, median r(ring>0.5) {med_ring:.3f}, "
               f"mean R(cond) {R_pred:.3f}, s(cond)_mean {S_pred:.4f}, sigma(cond)_mean {Sigma_pred:.4f}, "
-              f"Δ(ring)={med_ring-R_pred:.3f}")
+              f"λ(cond)~{lam_pred:.1f}, Δ(ring)={med_ring-R_pred:.3f}")
     else:
         print(f"[diag] VAL ev {ev}: median r(all) {med_all:.3f}, mean R(cond) {R_pred:.3f}, "
-              f"s(cond)_mean {S_pred:.4f}, sigma(cond)_mean {Sigma_pred:.4f} "
+              f"s(cond)_mean {S_pred:.4f}, sigma(cond)_mean {Sigma_pred:.4f}, λ(cond)~{lam_pred:.1f} "
               f"(no strong ring responsibility)")
 
 for ev in evs_to_plot:
@@ -856,4 +898,41 @@ print(f"Unique training events available: {len(ev_train)}")
 print(f"Unique training events seen in batches: {len(seen_train_events)} "
       f"({len(seen_train_events)/max(1,len(ev_train)):.1%})")
 print("─────────────────────────────────────────────────────────")
+
+# ───────────────────── 11. VALIDATION HIT-COUNT DISTRIBUTIONS ─────
+# Use every 50th validation event (fallback to all if fewer than 50).
+val_events_all = [int(ev) for ev in ev_val if ev in prim_map and ev in hits]
+if len(val_events_all) == 0:
+    print("[counts] No validation events found; skipping count distribution plot.")
+else:
+    if len(val_events_all) >= 50:
+        val_events_sub = val_events_all[::50]
+    else:
+        val_events_sub = val_events_all
+    print(f"[counts] Using {len(val_events_sub)} validation events (every 50th).")
+
+    real_counts = np.array([len(hits[ev]) for ev in val_events_sub], dtype=np.int32)
+
+    gen_counts = []
+    for ev in val_events_sub:
+        _, N_gen = sample_event(prim_map[ev], N=None, sample_N=True,
+                                ckpt_path="cnf_condN_condRing.pt", dev=device)
+        gen_counts.append(N_gen)
+    gen_counts = np.array(gen_counts, dtype=np.int32)
+
+    lo = int(min(real_counts.min(), gen_counts.min()))
+    hi = int(max(real_counts.max(), gen_counts.max()))
+    bins = np.arange(lo - 0.5, hi + 1.5, 1.0)
+
+    plt.figure(figsize=(8, 4.5))
+    plt.hist(real_counts, bins=bins, alpha=0.6, label="Real (validation, subsampled)", edgecolor="black")
+    plt.hist(gen_counts,  bins=bins, alpha=0.6, label="Generated (Poisson λ(cond))", edgecolor="black")
+    plt.xlabel("Hits per event")
+    plt.ylabel("Number of events")
+    plt.title("Validation hit-count distribution (every 50th event): real vs generated")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("val_hitcount_distribution_poisson_subsample50.png", dpi=160)
+    plt.close()
+    print("[counts] Saved val_hitcount_distribution_poisson_subsample50.png")
 
