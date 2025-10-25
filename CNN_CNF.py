@@ -7,7 +7,7 @@
 import math, random, re, os
 from pathlib import Path
 from collections import defaultdict
-
+from matplotlib.colors import LogNorm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -713,11 +713,39 @@ def _first_n_evs_from_primaries(n=10):
 
 def _draw_hitmap(ax, xy, extent, bins=100, vmax=None, title=""):
     if len(xy) == 0:
-        ax.set_title(title + " (no hits)"); ax.set_xticks([]); ax.set_yticks([]); ax.set_aspect("equal"); return
-    H, _, _ = np.histogram2d(xy[:,0], xy[:,1], bins=bins,
-                             range=[[extent[0], extent[1]], [extent[2], extent[3]]])
-    ax.imshow(H.T, origin="lower", extent=extent, aspect="equal", vmin=0, vmax=vmax)
-    ax.set_title(title); ax.set_xlabel("x"); ax.set_ylabel("y")
+        ax.set_title(title + " (no hits)")
+        ax.set_xticks([]); ax.set_yticks([]); ax.set_aspect("equal")
+        return
+
+    H, _, _ = np.histogram2d(
+        xy[:,0], xy[:,1], bins=bins,
+        range=[[extent[0], extent[1]], [extent[2], extent[3]]]
+    )
+
+    # Transpose for imshow and mask zeros so LogNorm is happy
+    H = H.T
+    H_masked = np.where(H > 0, H, np.nan)
+
+    # Choose color scale; keep optional vmax override
+    v_max = (np.nanmax(H_masked) if vmax is None else float(vmax))
+    if not np.isfinite(v_max) or v_max <= 0:
+        v_max = 1.0  # fallback
+
+    # Integer counts => set vmin=1 so we’re effectively log(1..v_max)
+    im = ax.imshow(
+        H_masked,
+        origin="lower",
+        extent=extent,
+        aspect="equal",
+        norm=LogNorm(vmin=1.0, vmax=v_max)
+    )
+
+    ax.set_title(title)
+    ax.set_xlabel("x"); ax.set_ylabel("y")
+
+    # Add a small colorbar per panel
+    ax.get_figure().colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Hits (log scale)")
+
 
 Path("hitmap").mkdir(exist_ok=True)
 evs_to_plot = _first_n_evs_from_primaries(10)
