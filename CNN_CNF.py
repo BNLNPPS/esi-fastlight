@@ -924,6 +924,22 @@ else:
     hi = int(max(real_counts.max(), gen_counts.max()))
     bins = np.arange(lo - 0.5, hi + 1.5, 1.0)
 
+    real_hist, _ = np.histogram(real_counts, bins=bins)
+    gen_hist,  _ = np.histogram(gen_counts,  bins=bins)
+
+    # Persist everything needed to reproduce or rebin later
+    out_path = "val_hitcount_distribution_poisson_subsample50-data.npz"
+    np.savez_compressed(
+    out_path,
+    bins=bins,                      # bin edges used in the plot
+    real_hist=real_hist,            # counts in each bin (real)
+    gen_hist=gen_hist,              # counts in each bin (generated)
+    real_counts_raw=real_counts,    # raw per-event counts (real)
+    gen_counts_raw=gen_counts,      # raw per-event counts (generated)
+    event_ids=np.array(val_events_sub, dtype=np.int64)  # which events were used
+    )
+    print(f"[counts] Saved histogram data to {out_path}")
+
     plt.figure(figsize=(8, 4.5))
     plt.hist(real_counts, bins=bins, alpha=0.6, label="Real (validation, subsampled)", edgecolor="black")
     plt.hist(gen_counts,  bins=bins, alpha=0.6, label="Generated (Poisson λ(cond))", edgecolor="black")
