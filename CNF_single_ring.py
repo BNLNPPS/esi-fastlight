@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.amp import autocast, GradScaler
+# AMP disabled — exact divergence is fragile under fp16
 
 import matplotlib
 matplotlib.use("Agg")
@@ -41,9 +41,9 @@ H_DIM      = 16
 MAX_RINGS  = 1         # single ring only
 VF_HIDDEN  = 128
 
-# Training — quick test (~10 min)
+# Training — overnight run (~12h, no AMP)
 BATCH_EVENTS = 8
-EPOCHS       = 5
+EPOCHS       = 4
 KL_BETA      = 1.0
 LR           = 3e-4
 WEIGHT_DECAY = 1e-4
@@ -340,6 +340,7 @@ class MultiRingPrior(nn.Module):
             -((r - Rs) ** 2) / (2 * self.ring_s ** 2)
             - torch.log(r + 1e-6)
             - math.log(self.ring_s * math.sqrt(2 * math.pi))
+            - math.log(2 * math.pi)         # angular normalization (uniform on circle)
         )                                   # (B, K)
 
         # Center log-prob — tight 2D Gaussian at ring center
@@ -390,21 +391,58 @@ def kl_diag_normals(mu_q, logstd_q, mu_p, logstd_p):
     return ((var_q + (mu_q - mu_p) ** 2) / var_p
             - 1.0 + 2 * (logstd_p - logstd_q)).sum(-1) * 0.5
 
+
+class CountHead(nn.Module):
+    """Predict hit count distribution from (c, h). NegBin(mu, alpha)."""
+    def __init__(self, cond_dim, h_dim, init_mean=250.0):
+        super().__init__()
+        self.net = MLP([cond_dim + h_dim, 64, 64, 2])  # outputs: log_mu, log_alpha
+        with torch.no_grad():
+            nn.init.zeros_(self.net.net[-1].weight)
+            self.net.net[-1].bias.copy_(torch.tensor([math.log(init_mean), math.log(0.01)]))
+
+    def forward(self, c, h):
+        out = self.net(torch.cat([c, h], -1))
+        log_mu, log_alpha = out[..., 0], out[..., 1]
+        mu = torch.exp(log_mu).clamp(min=1.0, max=2000.0)
+        alpha = torch.exp(log_alpha).clamp(min=1e-4, max=10.0)
+        return mu, alpha
+
+    def log_prob(self, n, c, h):
+        mu, alpha = self(c, h)
+        r = 1.0 / alpha
+        p = 1.0 / (1.0 + alpha * mu)
+        return (torch.lgamma(n + r) - torch.lgamma(n + 1) - torch.lgamma(r)
+                + r * torch.log(p) + n * torch.log(1 - p + 1e-8))
+
+    def sample_count(self, c, h):
+        mu, alpha = self(c, h)
+        r = 1.0 / alpha
+        p = 1.0 / (1.0 + alpha * mu)
+        # log_prob uses "failures before r successes" convention where p = success prob.
+        # PyTorch NegativeBinomial counts "successes before total_count failures",
+        # so we pass probs=1-p to match our log_prob convention.
+        return int(torch.distributions.NegativeBinomial(r, probs=1.0 - p).sample().clamp(min=10).item())
+
+
 # ────────────────────────────────────────────────────────────────────────────────
 # 5) BUILD MODEL
 # ────────────────────────────────────────────────────────────────────────────────
+train_mean_count = float(np.mean([len(hits[e]) for e in ev_train]))
+
 cr      = MultiCenterRadius(COND_DIM, H_DIM).to(device)
 vf      = VF(COND_DIM, H_DIM).to(device)
 odef    = CNF_ODE(vf, cr).to(device)
 prior_h = PriorH(COND_DIM, H_DIM).to(device)
 post_h  = InferenceH(COND_DIM, H_DIM).to(device)
 prior_z = MultiRingPrior(cr, COND_DIM, H_DIM).to(device)
+count_head = CountHead(COND_DIM, H_DIM, init_mean=train_mean_count).to(device)
 
 # cr is owned by prior_z, include it once
 params = (list(vf.parameters()) + list(prior_h.parameters())
-          + list(post_h.parameters()) + list(prior_z.parameters()))
+          + list(post_h.parameters()) + list(prior_z.parameters())
+          + list(count_head.parameters()))
 opt    = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
-scaler = GradScaler(enabled=(device.type == 'cuda'))
 
 n_params = sum(p.numel() for p in params)
 print(f"Model parameters: {n_params:,}")
@@ -469,22 +507,27 @@ def event_elbo(batch_events, kl_beta=1.0):
         h_rep = h[None, :].expand(xy.size(0), -1)
         xyh   = torch.cat([xy, c_rep, h_rep], dim=1)
         logp, _ = flow_forward_logp(xyh)
-        recon = logp.mean()
+        recon = logp.sum() / 250.0  # joint set likelihood, scaled by typical N for stability
 
-        elbo = recon - kl_beta * kl
+        # Count log-likelihood
+        n_hits = torch.tensor(float(xy.size(0)), device=device)
+        count_ll = count_head.log_prob(n_hits, c, h)
+
+        elbo = recon - kl_beta * kl + count_ll
         # Entropy bonus on mixture weights
         w = prior_z.weights(c, h)
         entropy = -(w * torch.log(w + 1e-8)).sum()
         elbo = elbo + ENTROPY_ALPHA * entropy
         elbos.append(elbo)
-        stats.append({'recon': recon.detach(), 'kl': kl.detach(), 'Ni': xy.size(0)})
+        stats.append({'recon': recon.detach(), 'kl': kl.detach(),
+                      'count_ll': count_ll.detach(), 'Ni': xy.size(0)})
     return torch.stack(elbos).mean(), stats
 
 Path("progress").mkdir(exist_ok=True)
 
 @torch.no_grad()
-def sample_event(cond_raw, N=200):
-    """Generate N hits for a given primary conditioner."""
+def sample_event(cond_raw, N=None):
+    """Generate hits for a given primary conditioner. N=None uses count head."""
     c = (torch.tensor(cond_raw, dtype=torch.float32, device=device)
          - torch.tensor(param_mean, device=device)) / torch.tensor(param_std, device=device)
     c = c.unsqueeze(0)
@@ -492,6 +535,9 @@ def sample_event(cond_raw, N=200):
     mu_p, logstd_p = prior_h(c.squeeze(0))
     h = mu_p + torch.exp(logstd_p) * torch.randn_like(mu_p)
     h = h.unsqueeze(0)  # (1, H_DIM) to match c
+
+    if N is None:
+        N = count_head.sample_count(c.squeeze(0), h.squeeze(0))
 
     zxy, _ = prior_z.sample(c, h, N)
     c_rep = c.expand(N, -1)
@@ -529,7 +575,7 @@ def plot_compare(ev, k=0):
     real_xy = np.asarray(hits[ev], np.float32)
     if real_xy.size == 0: return
     cond_raw = prim_map[ev]
-    gen_xy = sample_event(cond_raw, N=len(real_xy))
+    gen_xy = sample_event(cond_raw)
     extent = DATA_EXTENT
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
@@ -566,20 +612,19 @@ for ep in range(1, EPOCHS + 1):
     # ── Train ──
     beta = min(1.0, ep / KL_WARMUP)
     odef.compute_divergence = True
-    for m in [vf, cr, prior_h, post_h, prior_z]: m.train()
+    for m in [vf, cr, prior_h, post_h, prior_z, count_head]: m.train()
     total_batches = len(train_loader)
     epoch_start = time.time()
     train_elbo_acc = 0.0
 
     for bi, batch in enumerate(train_loader, 1):
         opt.zero_grad(set_to_none=True)
-        with autocast(device_type='cuda', enabled=(device.type == 'cuda')):
-            elbo, stats = event_elbo(batch, kl_beta=beta)
-            loss = -elbo
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
+        # No AMP for ODE/divergence path — exact divergence is fragile under fp16
+        elbo, stats = event_elbo(batch, kl_beta=beta)
+        loss = -elbo
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
-        scaler.step(opt); scaler.update()
+        opt.step()
 
         train_elbo_acc += elbo.item()
         Ni = sum(s['Ni'] for s in stats)
@@ -593,7 +638,7 @@ for ep in range(1, EPOCHS + 1):
     print()
 
     # ── Validate ──
-    for m in [vf, cr, prior_h, post_h, prior_z]: m.eval()
+    for m in [vf, cr, prior_h, post_h, prior_z, count_head]: m.eval()
     val_elbos = []
     val_start = time.time()
     with torch.no_grad():
@@ -621,8 +666,10 @@ for ep in range(1, EPOCHS + 1):
             'prior_h': prior_h.state_dict(),
             'post_h':  post_h.state_dict(),
             'prior_z': prior_z.state_dict(),
+            'count_head': count_head.state_dict(),
             'xy_mean': xy_mean, 'iso_std': iso_std,
             'param_mean': param_mean, 'param_std': param_std,
+            'train_mean_count': train_mean_count,
             'config': dict(COND_DIM=COND_DIM, H_DIM=H_DIM, MAX_RINGS=MAX_RINGS,
                            VF_HIDDEN=VF_HIDDEN, RING_S=RING_S, BG_SIGMA=BG_SIGMA,
                            ATOL=ATOL, RTOL=RTOL, STEP=STEP),
@@ -642,8 +689,10 @@ torch.save({
     'prior_h': prior_h.state_dict(),
     'post_h':  post_h.state_dict(),
     'prior_z': prior_z.state_dict(),
+    'count_head': count_head.state_dict(),
     'xy_mean': xy_mean, 'iso_std': iso_std,
     'param_mean': param_mean, 'param_std': param_std,
+    'train_mean_count': train_mean_count,
     'config': dict(COND_DIM=COND_DIM, H_DIM=H_DIM, MAX_RINGS=MAX_RINGS,
                    VF_HIDDEN=VF_HIDDEN, RING_S=RING_S, BG_SIGMA=BG_SIGMA,
                    ATOL=ATOL, RTOL=RTOL, STEP=STEP),

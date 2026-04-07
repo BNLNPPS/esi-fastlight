@@ -3,14 +3,13 @@
 Generate synthetic events from a trained T3_single checkpoint.
 
 Usage:
-  /usr/bin/python3.9 generate_T3_single.py                          # 1000 events, Poisson(250) hits
-  /usr/bin/python3.9 generate_T3_single.py -n 5000 --hits 300       # 5000 events, fixed 300 hits
-  /usr/bin/python3.9 generate_T3_single.py -n 50000 -o events.npy   # 50k events → events.npy
-  /usr/bin/python3.9 generate_T3_single.py --save-plots 20          # save 20 hitmap PNGs
+  /usr/bin/python3.9 generate_CNF_single_ring.py                          # 1000 events, learned NegBin counts
+  /usr/bin/python3.9 generate_CNF_single_ring.py -n 5000 --hits 300       # 5000 events, fixed 300 hits
+  /usr/bin/python3.9 generate_CNF_single_ring.py -n 50000 -o events.npy   # 50k events → events.npy
+  /usr/bin/python3.9 generate_CNF_single_ring.py --save-plots 20          # save 20 hitmap PNGs
 """
 
-import argparse, math, os, re, time
-from collections import defaultdict
+import argparse, math, os, time
 from pathlib import Path
 
 import numpy as np
@@ -142,6 +141,28 @@ class MultiRingPrior(nn.Module):
         return torch.stack(out, dim=0), idx
 
 
+class CountHead(nn.Module):
+    """Predict hit count distribution from (c, h). NegBin(mu, alpha)."""
+    def __init__(self, cond_dim, h_dim, init_mean=250.0):
+        super().__init__()
+        self.net = MLP([cond_dim + h_dim, 64, 64, 2])
+
+    def forward(self, c, h):
+        out = self.net(torch.cat([c, h], -1))
+        log_mu, log_alpha = out[..., 0], out[..., 1]
+        mu = torch.exp(log_mu).clamp(min=1.0, max=2000.0)
+        alpha = torch.exp(log_alpha).clamp(min=1e-4, max=10.0)
+        return mu, alpha
+
+    def sample_count(self, c, h):
+        mu, alpha = self(c, h)
+        r = 1.0 / alpha
+        p = 1.0 / (1.0 + alpha * mu)
+        # PyTorch NegBin counts successes before failures; our log_prob uses
+        # failures-before-successes convention, so pass probs=1-p
+        return int(torch.distributions.NegativeBinomial(r, probs=1.0 - p).sample().clamp(min=10).item())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2) LOAD CHECKPOINT & BUILD MODEL
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,19 +179,23 @@ def load_model(ckpt_path, device):
     step      = cfg['STEP']
     atol      = cfg['ATOL']
     rtol      = cfg['RTOL']
+    train_mean_count = ckpt.get('train_mean_count', 250.0)
 
     cr      = MultiCenterRadius(cond_dim, h_dim, max_rings).to(device)
     vf      = VF(cond_dim, h_dim, max_rings, vf_hidden).to(device)
     odef    = CNF_ODE(vf, cr, cond_dim, h_dim).to(device)
     prior_h = PriorH(cond_dim, h_dim).to(device)
     prior_z = MultiRingPrior(cr, cond_dim, h_dim, max_rings, ring_s, bg_sigma).to(device)
+    count_h = CountHead(cond_dim, h_dim, init_mean=train_mean_count).to(device)
 
     vf.load_state_dict(ckpt['vf'])
     cr.load_state_dict(ckpt['cr'])
     prior_h.load_state_dict(ckpt['prior_h'])
     prior_z.load_state_dict(ckpt['prior_z'])
+    if 'count_head' in ckpt:
+        count_h.load_state_dict(ckpt['count_head'])
 
-    for m in [vf, cr, prior_h, prior_z]:
+    for m in [vf, cr, prior_h, prior_z, count_h]:
         m.eval()
 
     norm = {
@@ -181,7 +206,7 @@ def load_model(ckpt_path, device):
     }
     ode_cfg = {'step': step, 'atol': atol, 'rtol': rtol}
 
-    return odef, prior_h, prior_z, norm, ode_cfg, cond_dim
+    return odef, prior_h, prior_z, count_h, norm, ode_cfg, cond_dim
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,26 +230,12 @@ def parse_primaries(path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) HIT COUNT DISTRIBUTION (from real data)
-# ─────────────────────────────────────────────────────────────────────────────
-def load_hit_counts(opticks_file):
-    """Parse hit file to get per-event hit counts for sampling."""
-    pat = re.compile(r"([\deE.+-]+)\s+[\deE.+-]+\s+\(([^)]+)\).*")
-    counts = defaultdict(int)
-    for ln in open(opticks_file, "r"):
-        m = pat.match(ln)
-        if not m: continue
-        ev = int(float(m.group(1)) // 1000)
-        counts[ev] += 1
-    return np.array(list(counts.values()), dtype=np.int32)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # 5) GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def generate_event(odef, prior_h, prior_z, cond_raw, norm, ode_cfg, N, device):
-    """Generate N hits for one conditioner vector. Returns (N, 2) numpy array in mm."""
+def generate_event(odef, prior_h, prior_z, count_h, cond_raw, norm, ode_cfg, N, device):
+    """Generate N hits for one conditioner vector. Returns (N, 2) numpy array in mm.
+    If N is None, uses count head to predict hit count."""
     param_mean = torch.tensor(norm['param_mean'], device=device)
     param_std  = torch.tensor(norm['param_std'], device=device)
     xy_mean    = torch.tensor(norm['xy_mean'], device=device)
@@ -236,6 +247,9 @@ def generate_event(odef, prior_h, prior_z, cond_raw, norm, ode_cfg, N, device):
     mu_p, logstd_p = prior_h(c.squeeze(0))
     h = mu_p + torch.exp(logstd_p) * torch.randn_like(mu_p)
     h = h.unsqueeze(0)
+
+    if N is None:
+        N = count_h.sample_count(c.squeeze(0), h.squeeze(0))
 
     zxy, comp_idx = prior_z.sample(c, h, N)
     c_rep = c.expand(N, -1)
@@ -273,8 +287,6 @@ def main():
     p = argparse.ArgumentParser(description="Generate events from T3_single checkpoint")
     p.add_argument("-m", "--model", default="single_cnf_best.pt", help="Checkpoint path")
     p.add_argument("-p", "--primaries", default="primaries.csv")
-    p.add_argument("--opticks", default="/home/ggalgoczi/surrogate/esi-fastlight/opticks_hits_output.txt",
-                   help="Opticks hit file (for hit count distribution)")
     p.add_argument("-n", "--num-events", type=int, default=1000)
     p.add_argument("-o", "--output", default="generated_events.npy",
                    help="Output .npy file (ragged array of (N_i, 2) per event)")
@@ -291,23 +303,19 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     print(f"Loading model from {args.model} ...")
-    odef, prior_h_net, prior_z_net, norm, ode_cfg, cond_dim = load_model(args.model, device)
+    odef, prior_h_net, prior_z_net, count_h_net, norm, ode_cfg, cond_dim = load_model(args.model, device)
 
     print(f"Loading primaries from {args.primaries} ...")
     prim_map = parse_primaries(args.primaries)
     ev_ids = sorted(prim_map.keys())
     print(f"  {len(ev_ids)} primaries available")
 
-    # Hit count distribution
+    # Hit count mode
+    use_count_head = (args.hits == 0)
     if args.hits > 0:
         print(f"Using fixed hit count: {args.hits}")
-        sample_nhits = lambda: args.hits
     else:
-        print(f"Loading hit counts from {args.opticks} ...")
-        real_counts = load_hit_counts(args.opticks)
-        print(f"  Real hit counts: mean={real_counts.mean():.0f}, "
-              f"std={real_counts.std():.0f}, range=[{real_counts.min()}, {real_counts.max()}]")
-        sample_nhits = lambda: int(np.random.choice(real_counts))
+        print("Using learned count head (NegBin)")
 
     # Detector extent for plots
     extent = [-1150, 1150, -1150, 1150]
@@ -327,8 +335,8 @@ def main():
     t0 = time.time()
 
     for i, ev in enumerate(selected):
-        N = sample_nhits()
-        xy, comp = generate_event(odef, prior_h_net, prior_z_net,
+        N = args.hits if args.hits > 0 else None
+        xy, comp = generate_event(odef, prior_h_net, prior_z_net, count_h_net,
                                   prim_map[ev], norm, ode_cfg, N, device)
         all_events.append(xy.astype(np.float32))
         all_conds.append(prim_map[ev])
