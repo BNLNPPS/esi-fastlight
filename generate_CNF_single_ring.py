@@ -230,12 +230,34 @@ def parse_primaries(path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5) GENERATION
+# 5) DETECTOR MASK & GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
+# Dead zone geometry (measured from 25M hits):
+#   - Central cross extends ~183mm from origin along each axis
+#   - Horizontal arm: |y| < 60mm AND |x| < 183mm
+#   - Vertical arm:   |x| < 60mm AND |y| < 183mm
+#   - Outside detector: r > 553mm
+CROSS_ARM_W   = 60.0   # mm, half-width of each arm
+CROSS_ARM_LEN = 183.0  # mm, half-length of each arm (from origin)
+DET_RADIUS    = 553.0  # mm
+
+def detector_mask(xy_mm):
+    """Return boolean mask: True = valid hit (keep), False = in dead zone or outside."""
+    x, y = xy_mm[:, 0], xy_mm[:, 1]
+    ax, ay = np.abs(x), np.abs(y)
+    # Cross: two arms intersecting at center, each ~183mm long, ~60mm wide
+    horiz_arm = (ay < CROSS_ARM_W) & (ax < CROSS_ARM_LEN)
+    vert_arm  = (ax < CROSS_ARM_W) & (ay < CROSS_ARM_LEN)
+    in_cross  = horiz_arm | vert_arm
+    outside   = (x**2 + y**2) > DET_RADIUS**2
+    return ~in_cross & ~outside
+
 @torch.no_grad()
-def generate_event(odef, prior_h, prior_z, count_h, cond_raw, norm, ode_cfg, N, device):
+def generate_event(odef, prior_h, prior_z, count_h, cond_raw, norm, ode_cfg, N, device,
+                   apply_mask=True, oversample=1.3, max_retries=5):
     """Generate N hits for one conditioner vector. Returns (N, 2) numpy array in mm.
-    If N is None, uses count head to predict hit count."""
+    If N is None, uses count head to predict hit count.
+    If apply_mask, rejects hits in dead zone / outside detector and resamples."""
     param_mean = torch.tensor(norm['param_mean'], device=device)
     param_std  = torch.tensor(norm['param_std'], device=device)
     xy_mean    = torch.tensor(norm['xy_mean'], device=device)
@@ -251,20 +273,47 @@ def generate_event(odef, prior_h, prior_z, count_h, cond_raw, norm, ode_cfg, N, 
     if N is None:
         N = count_h.sample_count(c.squeeze(0), h.squeeze(0))
 
-    zxy, comp_idx = prior_z.sample(c, h, N)
-    c_rep = c.expand(N, -1)
-    h_rep = h.expand(N, -1)
-    z = torch.cat([zxy, c_rep, h_rep], dim=1)
+    if not apply_mask:
+        # Original path: generate exactly N, no filtering
+        zxy, comp_idx = prior_z.sample(c, h, N)
+        c_rep = c.expand(N, -1)
+        h_rep = h.expand(N, -1)
+        z = torch.cat([zxy, c_rep, h_rep], dim=1)
+        x_inv, _ = odeint(
+            odef, (z, torch.zeros(N, 1, device=device)),
+            torch.tensor([1., 0.], device=device),
+            method="rk4", options={"step_size": ode_cfg['step']},
+            atol=ode_cfg['atol'], rtol=ode_cfg['rtol']
+        )
+        xy = x_inv[-1][:, :2] * iso_std + xy_mean
+        return xy.cpu().numpy(), comp_idx.cpu().numpy()
 
-    x_inv, _ = odeint(
-        odef, (z, torch.zeros(N, 1, device=device)),
-        torch.tensor([1., 0.], device=device),
-        method="rk4", options={"step_size": ode_cfg['step']},
-        atol=ode_cfg['atol'], rtol=ode_cfg['rtol']
-    )
-    xy_norm = x_inv[-1][:, :2]
-    xy = xy_norm * iso_std + xy_mean
-    return xy.cpu().numpy(), comp_idx.cpu().numpy()
+    # Generate with oversampling + rejection loop
+    target = N
+    collected = []
+    for _ in range(max_retries):
+        n_gen = max(int(target * oversample), target + 10)
+        zxy, comp_idx = prior_z.sample(c, h, n_gen)
+        c_rep = c.expand(n_gen, -1)
+        h_rep = h.expand(n_gen, -1)
+        z = torch.cat([zxy, c_rep, h_rep], dim=1)
+        x_inv, _ = odeint(
+            odef, (z, torch.zeros(n_gen, 1, device=device)),
+            torch.tensor([1., 0.], device=device),
+            method="rk4", options={"step_size": ode_cfg['step']},
+            atol=ode_cfg['atol'], rtol=ode_cfg['rtol']
+        )
+        xy_mm = (x_inv[-1][:, :2] * iso_std + xy_mean).cpu().numpy()
+        mask = detector_mask(xy_mm)
+        collected.append(xy_mm[mask])
+        total = sum(len(c) for c in collected)
+        if total >= target:
+            break
+        target -= total  # still need this many
+        oversample = 1.5  # increase for next retry
+
+    all_xy = np.concatenate(collected, axis=0)[:N]
+    return all_xy, np.zeros(len(all_xy), dtype=np.int64)
 
 
 def save_hitmap(xy, ev_id, out_dir, extent, bins=100):
